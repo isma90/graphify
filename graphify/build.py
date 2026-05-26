@@ -305,12 +305,15 @@ def build_merge(
     dedup: bool = True,
     dedup_llm_backend: str | None = None,
     root: str | Path | None = None,
+    prune_ids: list[str] | None = None,
 ) -> nx.Graph:
     """Load existing graph.json, merge new chunks into it, and save back.
 
     Never replaces - only grows (or prunes deleted-file nodes via prune_sources).
     Safe to call repeatedly: existing nodes and edges are preserved.
     root: if given, absolute source_file paths in new_chunks are made relative (#932).
+    prune_ids: if given, remove nodes with matching ``id`` values (and their
+        incident edges) after the merge. Combinable with prune_sources.
     """
     graph_path = Path(graph_path)
     if graph_path.exists():
@@ -369,9 +372,20 @@ def build_merge(
                 file=sys.stderr,
             )
 
+    # Prune nodes (and their incident edges) by explicit id set
+    if prune_ids:
+        prune_id_set = set(prune_ids)
+        ids_to_remove = [n for n in G.nodes() if n in prune_id_set]
+        G.remove_nodes_from(ids_to_remove)
+        if ids_to_remove:
+            print(
+                f"[graphify] Pruned {len(ids_to_remove)} node(s) by id.",
+                file=sys.stderr,
+            )
+
     # Safety check: refuse to shrink the graph silently (#479)
-    # Skip when dedup or prune_sources is active — shrinkage is intentional there.
-    if graph_path.exists() and not dedup and not prune_sources:
+    # Skip when dedup, prune_sources, or prune_ids is active — shrinkage is intentional there.
+    if graph_path.exists() and not dedup and not prune_sources and not prune_ids:
         existing_n = len(existing_nodes)
         new_n = G.number_of_nodes()
         if new_n < existing_n:
@@ -381,6 +395,87 @@ def build_merge(
             )
 
     return G
+
+
+def three_way_merge_nodes(
+    base: nx.Graph,
+    ours: nx.Graph,
+    theirs: nx.Graph,
+    *,
+    max_nodes: int = 500_000,
+    dedup: bool = True,
+) -> tuple[nx.Graph, list[dict]]:
+    """3-way merge of three graphs. Returns (merged_graph, conflicts).
+
+    Algorithm:
+      1. Compute merged = compose(ours, theirs) — union of both sides.
+      2. Identify conflicts: nodes present in both ours and theirs with
+         differing attributes, ignoring ``community`` and ``built_at_commit``
+         keys which change without being real conflicts.
+      3. For conflicts, default-pick "ours" attributes (caller may re-resolve).
+      4. If dedup=True, run fuzzy dedup the same way build() does.
+      5. Validate len(merged) <= max_nodes; raise ValueError if exceeded.
+
+    Args:
+        base: The common ancestor graph (used to identify conflicts).
+        ours: Our side of the merge (current branch).
+        theirs: Their side of the merge (other branch).
+        max_nodes: Hard cap on merged node count. Raises ValueError if exceeded.
+        dedup: If True, run entity deduplication on the merged result.
+
+    Returns:
+        A tuple of (merged_graph, conflicts) where conflicts is a list of dicts
+        with keys ``id``, ``base`` (attrs or None), ``ours`` (attrs), ``theirs``
+        (attrs) — one entry per node that had diverging attributes on both sides.
+    """
+    from graphify.dedup import deduplicate_entities
+
+    # Step 1: union-merge ours and theirs; ours attrs win on collision (compose
+    # semantics: second graph's attrs overwrite first's, so pass ours second).
+    merged: nx.Graph = nx.compose(theirs, ours)
+
+    # Step 2 & 3: detect attribute conflicts and enforce "ours wins" resolution.
+    _IGNORE_KEYS = {"community", "built_at_commit"}
+    conflicts: list[dict] = []
+
+    shared_ids = set(ours.nodes()) & set(theirs.nodes())
+    for node_id in shared_ids:
+        our_attrs = dict(ours.nodes[node_id])
+        their_attrs = dict(theirs.nodes[node_id])
+
+        our_cmp = {k: v for k, v in our_attrs.items() if k not in _IGNORE_KEYS}
+        their_cmp = {k: v for k, v in their_attrs.items() if k not in _IGNORE_KEYS}
+
+        if our_cmp != their_cmp:
+            base_attrs: dict | None = dict(base.nodes[node_id]) if node_id in base.nodes else None
+            conflicts.append({
+                "id": node_id,
+                "base": base_attrs,
+                "ours": our_attrs,
+                "theirs": their_attrs,
+            })
+            # Enforce "ours" wins: compose already set ours attrs; nothing more needed.
+
+    # Step 4: optional fuzzy dedup
+    if dedup and merged.number_of_nodes() > 0:
+        nodes_list = [{"id": n, **d} for n, d in merged.nodes(data=True)]
+        edges_list = [
+            {"source": u, "target": v, **d}
+            for u, v, d in merged.edges(data=True)
+        ]
+        deduped_nodes, deduped_edges = deduplicate_entities(
+            nodes_list, edges_list, communities={}, dedup_llm_backend=None
+        )
+        merged = build_from_json({"nodes": deduped_nodes, "edges": deduped_edges})
+
+    # Step 5: node-count cap
+    if merged.number_of_nodes() > max_nodes:
+        raise ValueError(
+            f"graphify: three_way_merge_nodes result has {merged.number_of_nodes()} nodes, "
+            f"exceeds max_nodes cap of {max_nodes}."
+        )
+
+    return merged, conflicts
 
 
 def prefix_graph_for_global(G: nx.Graph, repo_tag: str) -> nx.Graph:

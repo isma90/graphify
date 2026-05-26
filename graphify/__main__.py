@@ -2357,8 +2357,8 @@ def main() -> None:
         # the merge so a human can investigate.
         _MERGE_MAX_BYTES = 50 * 1024 * 1024
         _MERGE_MAX_NODES = 100_000
-        import networkx as _nx
         from networkx.readwrite import json_graph as _jg
+        from graphify.build import three_way_merge_nodes as _three_way_merge_nodes
         def _load_graph(p: str):
             path_obj = Path(p)
             try:
@@ -2375,18 +2375,18 @@ def main() -> None:
             except TypeError:
                 return _jg.node_link_graph(data), data
         try:
+            G_base, _ = _load_graph(_base_path)
             G_cur, _ = _load_graph(_current_path)
             G_oth, _ = _load_graph(_other_path)
         except Exception as exc:
             print(f"[graphify merge-driver] error loading graphs: {exc}", file=sys.stderr)
             sys.exit(1)  # surface the conflict so git doesn't accept a corrupt merge
-        merged = _nx.compose(G_cur, G_oth)
-        if merged.number_of_nodes() > _MERGE_MAX_NODES:
-            print(
-                f"[graphify merge-driver] merged graph has {merged.number_of_nodes()} nodes, "
-                f"exceeds {_MERGE_MAX_NODES}-node cap; aborting merge.",
-                file=sys.stderr,
+        try:
+            merged, _conflicts = _three_way_merge_nodes(
+                G_base, G_cur, G_oth, max_nodes=_MERGE_MAX_NODES, dedup=False
             )
+        except ValueError as exc:
+            print(f"[graphify merge-driver] {exc}", file=sys.stderr)
             sys.exit(1)
         try:
             out_data = _jg.node_link_data(merged, edges="links")
@@ -3019,6 +3019,10 @@ def main() -> None:
             print(f"[graphify extract] scanning {target}")
             detection = _detect(target, google_workspace=google_workspace or None, extra_excludes=cli_excludes or None)
 
+        # privacy_map is None in legacy mode (no overlay files present).
+        # Non-None means new mode: split into graph-private.json + graph-shared.json.
+        privacy_map = detection.get("privacy_map")
+
         files_by_type = detection.get("files", {})
         if incremental_mode:
             new_by_type = detection.get("new_files", {})
@@ -3058,6 +3062,8 @@ def main() -> None:
             ast_kwargs: dict = {"cache_root": target}
             if cli_max_workers is not None:
                 ast_kwargs["max_workers"] = cli_max_workers
+            if privacy_map is not None:
+                ast_kwargs["privacy_map"] = privacy_map
             print(f"[graphify extract] AST extraction on {len(code_files)} code files...")
             try:
                 ast_result = _ast_extract(code_files, **ast_kwargs)
@@ -3236,98 +3242,183 @@ def main() -> None:
             build_merge as _build_merge,
         )
         from graphify.cluster import cluster as _cluster, score_all as _score_all
-        from graphify.export import to_json as _to_json
+        from graphify.export import to_json as _to_json, backup_if_protected as _backup
         from graphify.analyze import god_nodes as _god_nodes, surprising_connections as _surprising
         dedup_backend = backend if dedup_llm else None
-        if incremental_mode:
-            G = _build_merge(
-                [merged],
-                graph_path=existing_graph_path,
-                prune_sources=deleted_files or None,
-                dedup=True,
-                dedup_llm_backend=dedup_backend,
-                root=target,
-            )
-        else:
-            G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target)
-        if G.number_of_nodes() == 0:
-            print(
-                "[graphify extract] graph is empty — extraction produced no nodes. "
-                "Possible causes: all files skipped, binary-only corpus, or LLM "
-                "returned no edges.",
-                file=sys.stderr,
-            )
-            sys.exit(1)
 
-        communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
-        cohesion = _score_all(G, communities)
-        try:
-            gods = _god_nodes(G)
-        except Exception:
-            gods = []
-        try:
-            surprises = _surprising(G, communities)
-        except Exception:
-            surprises = []
+        if privacy_map is None:
+            # ----------------------------------------------------------------
+            # LEGACY MODE: behaviour identical to v0.8.18.
+            # Single graph.json output, manifest without origin fields.
+            # ----------------------------------------------------------------
+            if incremental_mode:
+                G = _build_merge(
+                    [merged],
+                    graph_path=existing_graph_path,
+                    prune_sources=deleted_files or None,
+                    dedup=True,
+                    dedup_llm_backend=dedup_backend,
+                    root=target,
+                )
+            else:
+                G = _build([merged], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+            if G.number_of_nodes() == 0:
+                print(
+                    "[graphify extract] graph is empty — extraction produced no nodes. "
+                    "Possible causes: all files skipped, binary-only corpus, or LLM "
+                    "returned no edges.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
 
-        from graphify.export import backup_if_protected as _backup
-        _backup(graphify_out)
-        _to_json(G, communities, str(graph_json_path), force=True)
-        if merged.get("output_tokens", 0) > 0:
-            (graphify_out / ".graphify_semantic_marker").write_text(
-                json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"
-            )
-        if global_merge:
-            from graphify.global_graph import global_add as _global_add
-            _tag = global_repo_tag or target.name
+            communities = _cluster(G, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
+            cohesion = _score_all(G, communities)
             try:
-                result = _global_add(graphify_out / "graph.json", _tag)
-                if result["skipped"]:
-                    print(f"[graphify global] '{_tag}' unchanged since last add — skipped.")
-                else:
-                    print(f"[graphify global] '{_tag}' merged into global graph "
-                          f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
-            except Exception as exc:
-                print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
-        analysis = {
-            "communities": {str(k): v for k, v in communities.items()},
-            "cohesion": {str(k): v for k, v in cohesion.items()},
-            "gods": gods,
-            "surprises": surprises,
-            "tokens": {
-                "input": merged["input_tokens"],
-                "output": merged["output_tokens"],
-            },
-        }
-        analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
-        try:
-            _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both")
-        except Exception as exc:
-            print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+                gods = _god_nodes(G)
+            except Exception:
+                gods = []
+            try:
+                surprises = _surprising(G, communities)
+            except Exception:
+                surprises = []
 
-        cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
-        print(
-            f"[graphify extract] wrote {graph_json_path}: "
-            f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
-            f"{len(communities)} communities"
-        )
-        print(f"[graphify extract] wrote {analysis_path}")
-        if incremental_mode:
+            _backup(graphify_out)
+            _to_json(G, communities, str(graph_json_path), force=True)
+            if merged.get("output_tokens", 0) > 0:
+                (graphify_out / ".graphify_semantic_marker").write_text(
+                    json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"
+                )
+            if global_merge:
+                from graphify.global_graph import global_add as _global_add
+                _tag = global_repo_tag or target.name
+                try:
+                    result = _global_add(graphify_out / "graph.json", _tag)
+                    if result["skipped"]:
+                        print(f"[graphify global] '{_tag}' unchanged since last add — skipped.")
+                    else:
+                        print(f"[graphify global] '{_tag}' merged into global graph "
+                              f"(+{result['nodes_added']} nodes, -{result['nodes_removed']} pruned).")
+                except Exception as exc:
+                    print(f"[graphify global] warning: failed to merge into global graph: {exc}", file=sys.stderr)
+            analysis = {
+                "communities": {str(k): v for k, v in communities.items()},
+                "cohesion": {str(k): v for k, v in cohesion.items()},
+                "gods": gods,
+                "surprises": surprises,
+                "tokens": {
+                    "input": merged["input_tokens"],
+                    "output": merged["output_tokens"],
+                },
+            }
+            analysis_path.write_text(json.dumps(analysis, indent=2), encoding="utf-8")
+            try:
+                _save_manifest(_manifest_files, manifest_path=str(manifest_path), kind="both")
+            except Exception as exc:
+                print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+
+            cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
             print(
-                f"[graphify extract] incremental summary: "
-                f"{sem_cache_hits + unchanged_total} files cached/unchanged, "
-                f"{len(code_files) + sem_cache_misses} re-extracted, "
-                f"{len(deleted_files)} deleted"
+                f"[graphify extract] wrote {graph_json_path}: "
+                f"{G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
+                f"{len(communities)} communities"
             )
-        elif sem_cache_hits:
-            print(f"[graphify extract] semantic cache: {sem_cache_hits} cached, {sem_cache_misses} re-extracted")
-        if merged["input_tokens"] or merged["output_tokens"]:
+            print(f"[graphify extract] wrote {analysis_path}")
+            if incremental_mode:
+                print(
+                    f"[graphify extract] incremental summary: "
+                    f"{sem_cache_hits + unchanged_total} files cached/unchanged, "
+                    f"{len(code_files) + sem_cache_misses} re-extracted, "
+                    f"{len(deleted_files)} deleted"
+                )
+            elif sem_cache_hits:
+                print(f"[graphify extract] semantic cache: {sem_cache_hits} cached, {sem_cache_misses} re-extracted")
+            if merged["input_tokens"] or merged["output_tokens"]:
+                print(
+                    f"[graphify extract] tokens: "
+                    f"{merged['input_tokens']:,} in / "
+                    f"{merged['output_tokens']:,} out, "
+                    f"est. cost (~{backend}): ${cost:.4f}"
+                )
+
+        else:
+            # ----------------------------------------------------------------
+            # NEW MODE: split into graph-private.json + graph-shared.json.
+            # cluster() is called once per bucket (two calls — expected by plan).
+            # ----------------------------------------------------------------
+            from graphify.extract import split_extraction_by_origin as _split_extraction
+            from graphify.export import to_json_split as _to_json_split
+
+            private_extr, shared_extr = _split_extraction(merged, privacy_map)
+
+            # Build each bucket graph independently.
+            # Incremental merge against split graphs is not yet implemented
+            # (Stage 2); fall back to full rebuild from the split extraction.
+            G_private = _build([private_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+            G_shared = _build([shared_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+
+            if G_private.number_of_nodes() == 0 and G_shared.number_of_nodes() == 0:
+                print(
+                    "[graphify extract] graph is empty — extraction produced no nodes. "
+                    "Possible causes: all files skipped, binary-only corpus, or LLM "
+                    "returned no edges.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            # Cluster each bucket separately (two calls — expected by design).
+            communities_private = _cluster(G_private, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
+            communities_shared = _cluster(G_shared, resolution=cli_resolution, exclude_hubs_percentile=cli_exclude_hubs)
+
+            _backup(graphify_out)
+            _to_json_split(
+                G_private, communities_private,
+                G_shared, communities_shared,
+                out_dir=graphify_out,
+                force=True,
+            )
+
+            if merged.get("output_tokens", 0) > 0:
+                (graphify_out / ".graphify_semantic_marker").write_text(
+                    json.dumps({"output_tokens": merged["output_tokens"]}), encoding="utf-8"
+                )
+
+            try:
+                _save_manifest(
+                    _manifest_files,
+                    manifest_path=str(manifest_path),
+                    kind="both",
+                    privacy_map=privacy_map,
+                )
+            except Exception as exc:
+                print(f"[graphify extract] warning: could not write manifest: {exc}", file=sys.stderr)
+
+            cost = _estimate_cost(backend, merged["input_tokens"], merged["output_tokens"])
             print(
-                f"[graphify extract] tokens: "
-                f"{merged['input_tokens']:,} in / "
-                f"{merged['output_tokens']:,} out, "
-                f"est. cost (~{backend}): ${cost:.4f}"
+                f"[graphify extract] wrote graph-private.json: "
+                f"{G_private.number_of_nodes()} nodes, {G_private.number_of_edges()} edges, "
+                f"{len(communities_private)} communities"
             )
+            print(
+                f"[graphify extract] wrote graph-shared.json: "
+                f"{G_shared.number_of_nodes()} nodes, {G_shared.number_of_edges()} edges, "
+                f"{len(communities_shared)} communities"
+            )
+            if incremental_mode:
+                print(
+                    f"[graphify extract] incremental summary: "
+                    f"{sem_cache_hits + unchanged_total} files cached/unchanged, "
+                    f"{len(code_files) + sem_cache_misses} re-extracted, "
+                    f"{len(deleted_files)} deleted"
+                )
+            elif sem_cache_hits:
+                print(f"[graphify extract] semantic cache: {sem_cache_hits} cached, {sem_cache_misses} re-extracted")
+            if merged["input_tokens"] or merged["output_tokens"]:
+                print(
+                    f"[graphify extract] tokens: "
+                    f"{merged['input_tokens']:,} in / "
+                    f"{merged['output_tokens']:,} out, "
+                    f"est. cost (~{backend}): ${cost:.4f}"
+                )
 
     elif cmd == "cache-check":
         # graphify cache-check <files_from> [--root <dir>]
@@ -3450,6 +3541,106 @@ def main() -> None:
         out_path2.parent.mkdir(parents=True, exist_ok=True)
         out_path2.write_text(json.dumps(merged2, ensure_ascii=False), encoding="utf-8")
         print(f"Merged: {len(merged2['nodes'])} nodes, {len(merged2['edges'])} edges")
+
+    elif cmd == "init-sharing":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify init-sharing")
+        _parser.add_argument("--non-interactive", action="store_true",
+                             help="Skip prompts; use built-in defaults")
+        _parser.add_argument("--default-remote",
+                             help="Default remote URL for future syncs (written as a comment)")
+        _parser.add_argument("root", nargs="?", default=".",
+                             help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        from graphify.migrate import init_sharing as _init_sharing
+        _result = _init_sharing(
+            Path(_args.root),
+            interactive=not _args.non_interactive,
+            default_remote=_args.default_remote,
+        )
+        print(f"[graphify init-sharing] created: {list(_result.values())}")
+
+    elif cmd == "share":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify share")
+        _parser.add_argument("paths", nargs="+", help="Paths / patterns to mark as shared")
+        _parser.add_argument("--force", action="store_true",
+                             help="Add even if pattern also appears in .graphifyprivate")
+        _parser.add_argument("--root", default=".",
+                             help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root = Path(_args.root).resolve()
+        from graphify.migrate import add_pattern_to_overlay as _add_pattern
+        # Warn if any pattern is already explicitly private.
+        _private_file = _root / ".graphifyprivate"
+        _private_lines: list[str] = []
+        if _private_file.exists():
+            _private_lines = _private_file.read_text(encoding="utf-8").splitlines()
+        _private_set = {ln.strip() for ln in _private_lines if ln.strip() and not ln.startswith("#")}
+        _refused: list[str] = []
+        _to_add: list[str] = []
+        for _p in _args.paths:
+            if _p in _private_set and not _args.force:
+                print(
+                    f"warning: '{_p}' is already listed in .graphifyprivate — "
+                    "refusing (use --force to override).",
+                    file=sys.stderr,
+                )
+                _refused.append(_p)
+            else:
+                _to_add.append(_p)
+        if _to_add:
+            _out = _add_pattern(_root, "shared", _to_add)
+            print(f"[graphify share] added {_to_add} to {_out}")
+        if _refused:
+            sys.exit(1)
+
+    elif cmd == "unshare":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify unshare")
+        _parser.add_argument("paths", nargs="+", help="Paths / patterns to mark as private")
+        _parser.add_argument("--root", default=".",
+                             help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root = Path(_args.root).resolve()
+        from graphify.migrate import add_pattern_to_overlay as _add_pattern
+        _out = _add_pattern(_root, "private", _args.paths)
+        print(f"[graphify unshare] added {_args.paths} to {_out}")
+
+    elif cmd == "migrate-to-shared":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify migrate-to-shared")
+        _parser.add_argument("--non-interactive", action="store_true",
+                             help="Skip prompts; apply heuristics automatically")
+        _parser.add_argument("root", nargs="?", default=".",
+                             help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        from graphify.migrate import migrate_to_shared as _migrate_to_shared
+        _result = _migrate_to_shared(
+            Path(_args.root),
+            interactive=not _args.non_interactive,
+        )
+        _status = _result.get("status", "unknown")
+        if _status == "migrated":
+            print(
+                f"[graphify migrate-to-shared] Migration complete.\n"
+                f"  shared patterns : {_result.get('shared_patterns', [])}\n"
+                f"  private patterns: {_result.get('private_patterns', [])}\n"
+                f"  graph.json renamed: {_result.get('renamed_graph_json', False)}"
+            )
+        elif _status == "already_initialized":
+            print("[graphify migrate-to-shared] Already initialized — nothing to do.")
+        elif _status == "no_graph_json":
+            print(
+                "[graphify migrate-to-shared] No graphify-out/graph.json found. "
+                "Run 'graphify extract .' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        elif _status == "aborted":
+            print("[graphify migrate-to-shared] Aborted.")
+        else:
+            print(f"[graphify migrate-to-shared] status: {_status}")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.

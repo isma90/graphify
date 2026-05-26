@@ -8077,6 +8077,7 @@ def extract(
     *,
     parallel: bool = True,
     max_workers: int | None = None,
+    privacy_map: "dict[str, str] | None" = None,
 ) -> dict:
     """Extract AST nodes and edges from a list of code files.
 
@@ -8094,6 +8095,10 @@ def extract(
             use ProcessPoolExecutor for multi-core extraction.
         max_workers: max subprocess count. Defaults to cpu_count (or the
             value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
+        privacy_map: when provided (new mode), each node and edge in the result
+            gains an "origin" field ("private" or "shared") derived from the
+            file that produced it.  When None (legacy mode), no "origin" field
+            is stamped and behaviour is identical to v0.8.18.
     """
     paths = [Path(p) for p in paths]
     _check_tree_sitter_version()
@@ -8321,6 +8326,29 @@ def extract(
         except ValueError:
             pass
 
+    # Privacy stamping: only when privacy_map is provided (new mode).
+    # In legacy mode (privacy_map is None) we skip this entirely so the output
+    # is byte-identical to v0.8.18 for the same corpus.
+    if privacy_map is not None:
+        # Build a node_id → origin index for edge inheritance below.
+        node_id_to_origin: dict[str, str] = {}
+        for node in all_nodes:
+            src = node.get("source_file", "")
+            origin = privacy_map.get(src, "private")  # default private by safety
+            node["origin"] = origin
+            node_id_to_origin[node["id"]] = origin
+
+        for edge in all_edges:
+            src = edge.get("source_file", "")
+            if src:
+                edge["origin"] = privacy_map.get(src, "private")
+            else:
+                # Edge without source_file: inherit origin from the source node.
+                # "private wins" — if either endpoint is private, edge is private.
+                src_origin = node_id_to_origin.get(edge.get("source", ""), "private")
+                tgt_origin = node_id_to_origin.get(edge.get("target", ""), "private")
+                edge["origin"] = "private" if (src_origin == "private" or tgt_origin == "private") else "shared"
+
     return {
         "nodes": all_nodes,
         "edges": all_edges,
@@ -8365,6 +8393,109 @@ def collect_files(target: Path, *, follow_symlinks: bool = False, root: Path | N
             if p.suffix in _EXTENSIONS and not _ignored(p):
                 results.append(p)
     return sorted(results)
+
+
+def split_extraction_by_origin(result: dict, privacy_map: dict[str, str]) -> tuple[dict, dict]:
+    """Split an extraction dict (output of extract()) into two dicts: (private_dict, shared_dict).
+
+    Rules:
+      - Nodes with origin="private" go only to private_dict.
+      - Nodes with origin="shared" go only to shared_dict.
+      - Edges where BOTH endpoints are "shared" go only to shared_dict.
+      - Edges where ANY endpoint is "private" go only to private_dict (NEVER to
+        shared).  This is the "cross-bucket edges downgrade to the more-private
+        side" rule.
+      - Hyperedges where ALL member nodes are "shared" go to shared_dict; any
+        hyperedge with at least one private member goes to private_dict.
+      - input_tokens / output_tokens are placed in private_dict.  Rationale:
+        tokens represent the total extraction cost and cannot be attributed to
+        a specific bucket without per-file accounting; private is the safer
+        default because it avoids leaking cost metadata into the shared output.
+      - All other top-level keys from the input are preserved in private_dict.
+        shared_dict carries only the structural keys (nodes, edges, hyperedges,
+        input_tokens, output_tokens) to keep it self-contained.
+
+    The node_origin lookup prefers the "origin" field already stamped by
+    extract() (when privacy_map was passed to it).  For nodes whose "origin"
+    field is absent (e.g. nodes produced by the semantic pipeline before this
+    Stage was wired in), origin is derived from source_file via privacy_map,
+    with a hard default of "private" for safety.
+
+    Returns:
+        (private_dict, shared_dict), each a self-contained dict with the same
+        top-level structure as the input.  No cross-references to IDs absent
+        from the respective node set.
+
+    Args:
+        result: Output dict from extract() (or a merged AST+semantic dict with
+                the same structure: nodes, edges, hyperedges, input_tokens,
+                output_tokens).
+        privacy_map: Mapping of source_file string → "private"|"shared".
+    """
+    nodes: list[dict] = result.get("nodes", [])
+    edges: list[dict] = result.get("edges", [])
+    hyperedges: list[dict] = result.get("hyperedges", [])
+
+    # Build node_id → origin index.
+    # Priority: stamped "origin" field > privacy_map lookup > "private" default.
+    node_origin: dict[str, str] = {}
+    for node in nodes:
+        stamped = node.get("origin")
+        if stamped in ("private", "shared"):
+            node_origin[node["id"]] = stamped
+        else:
+            src = node.get("source_file", "")
+            node_origin[node["id"]] = privacy_map.get(src, "private")
+
+    # Split nodes.
+    private_nodes: list[dict] = []
+    shared_nodes: list[dict] = []
+    for node in nodes:
+        if node_origin.get(node["id"], "private") == "shared":
+            shared_nodes.append(node)
+        else:
+            private_nodes.append(node)
+
+    # Split edges: cross-bucket edges go to private.
+    private_edges: list[dict] = []
+    shared_edges: list[dict] = []
+    for edge in edges:
+        src_origin = node_origin.get(edge.get("source", ""), "private")
+        tgt_origin = node_origin.get(edge.get("target", ""), "private")
+        if src_origin == "shared" and tgt_origin == "shared":
+            shared_edges.append(edge)
+        else:
+            private_edges.append(edge)
+
+    # Split hyperedges: all-shared members → shared; any private member → private.
+    private_hyperedges: list[dict] = []
+    shared_hyperedges: list[dict] = []
+    for he in hyperedges:
+        members: list[str] = he.get("nodes", [])
+        if members and all(node_origin.get(m, "private") == "shared" for m in members):
+            shared_hyperedges.append(he)
+        else:
+            private_hyperedges.append(he)
+
+    # Preserve all top-level keys from input in private_dict.
+    private_dict: dict = {k: v for k, v in result.items()}
+    private_dict["nodes"] = private_nodes
+    private_dict["edges"] = private_edges
+    private_dict["hyperedges"] = private_hyperedges
+    # Tokens go entirely to private (see docstring rationale).
+    # shared_dict gets zeros so it is self-contained.
+    private_dict["input_tokens"] = result.get("input_tokens", 0)
+    private_dict["output_tokens"] = result.get("output_tokens", 0)
+
+    shared_dict: dict = {
+        "nodes": shared_nodes,
+        "edges": shared_edges,
+        "hyperedges": shared_hyperedges,
+        "input_tokens": 0,
+        "output_tokens": 0,
+    }
+
+    return private_dict, shared_dict
 
 
 if __name__ == "__main__":

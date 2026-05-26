@@ -28,14 +28,25 @@ _BACKUP_ARTIFACTS = [
     "cost.json",
 ]
 
+# Graph output files covered by the shrink-guard and backup machinery.
+# graph.json is the legacy single-graph output (v0.8.18 and earlier).
+# graph-private.json / graph-shared.json are the split-mode outputs (v0.9+).
+_GRAPH_FILES = ["graph.json", "graph-private.json", "graph-shared.json"]
+
 
 def backup_if_protected(out_dir: Path) -> "Path | None":
     """Snapshot graph artifacts to a dated subfolder before an overwrite.
 
-    Triggers when graph.json exists AND either:
+    Triggers when graph.json (or graph-private.json / graph-shared.json) exists
+    AND either:
     - .graphify_semantic_marker is present (graph cost real LLM tokens), or
     - .graphify_labels.json contains at least one non-default community label
       (graph has been curated by a human or skill).
+
+    Each graph file listed in _GRAPH_FILES is backed up individually; files
+    that do not exist on disk are silently skipped.  The dedup check (content
+    hash) is performed against graph.json for backwards compatibility — the
+    first present graph file in _GRAPH_FILES is used as the sentinel.
 
     Returns the backup folder path, or None if no backup was taken.
     Never raises — backup failure prints a warning but never blocks the write.
@@ -44,7 +55,16 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     if os.environ.get("GRAPHIFY_NO_BACKUP"):
         return None
     out = Path(out_dir)
-    if not (out / "graph.json").exists():
+
+    # Determine sentinel graph file: first existing file in _GRAPH_FILES.
+    sentinel_src: Path | None = None
+    for _gf in _GRAPH_FILES:
+        candidate = out / _gf
+        if candidate.exists():
+            sentinel_src = candidate
+            break
+
+    if sentinel_src is None:
         return None
 
     is_semantic = (out / ".graphify_semantic_marker").exists()
@@ -63,20 +83,21 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     reason = "+".join(filter(None, ["semantic" if is_semantic else "", "curated" if is_curated else ""]))
     today = date.today().isoformat()
     backup_dir = out / today
-    graph_src = out / "graph.json"
+    sentinel_name = sentinel_src.name
 
-    # Skip re-copying if today's backup already has identical graph.json content.
+    # Skip re-copying if today's backup already has identical sentinel content.
     # If content differs (graph changed since the last backup today), overwrite
     # the backup in place — one folder per day, always the latest pre-overwrite state.
-    if backup_dir.exists() and (backup_dir / "graph.json").exists():
-        src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
-        bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
+    if backup_dir.exists() and (backup_dir / sentinel_name).exists():
+        src_hash = hashlib.sha256(sentinel_src.read_bytes()).hexdigest()
+        bak_hash = hashlib.sha256((backup_dir / sentinel_name).read_bytes()).hexdigest()
         if src_hash == bak_hash:
             return backup_dir  # identical content, nothing to do
 
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
         copied = 0
+        # Back up fixed artifacts first.
         for name in _BACKUP_ARTIFACTS:
             src = out / name
             if src.exists():
@@ -85,6 +106,16 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
                     copied += 1
                 except Exception:
                     pass
+        # Back up any split-mode graph files not already in _BACKUP_ARTIFACTS.
+        for gf in _GRAPH_FILES:
+            if gf not in _BACKUP_ARTIFACTS:
+                src = out / gf
+                if src.exists():
+                    try:
+                        shutil.copy2(src, backup_dir / gf)
+                        copied += 1
+                    except Exception:
+                        pass
         if copied:
             print(f"[graphify] backed up {reason} graph ({copied} files) → {backup_dir.name}/")
         return backup_dir
@@ -92,6 +123,59 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
         import sys
         print(f"[graphify] warning: backup failed ({exc}) — continuing with overwrite", file=sys.stderr)
         return None
+
+
+def to_json_split(
+    G_private: nx.Graph,
+    communities_private: "dict[int, list[str]]",
+    G_shared: nx.Graph,
+    communities_shared: "dict[int, list[str]]",
+    out_dir: "str | Path" = "graphify-out",
+    *,
+    force: bool = False,
+    built_at_commit: "str | None" = None,
+) -> "tuple[bool, bool]":
+    """Write two separate JSON graph files: graph-private.json and graph-shared.json.
+
+    Calls to_json() internally for each bucket.  Does NOT write graph.json
+    (legacy filename) — that path is used exclusively by legacy mode.
+
+    Args:
+        G_private: NetworkX graph containing only private-bucket nodes/edges.
+        communities_private: Community dict for the private graph.
+        G_shared: NetworkX graph containing only shared-bucket nodes/edges.
+        communities_shared: Community dict for the shared graph.
+        out_dir: Output directory.  Files are written as
+            ``<out_dir>/graph-private.json`` and ``<out_dir>/graph-shared.json``.
+        force: When True, bypass the shrink-guard that refuses to overwrite a
+            larger existing graph with a smaller one.
+        built_at_commit: Optional git commit hash embedded in each output file.
+
+    Returns:
+        ``(private_ok, shared_ok)`` — True for each bucket whose write
+        succeeded (or was a valid shrink-guard skip).
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    private_path = str(out / "graph-private.json")
+    shared_path = str(out / "graph-shared.json")
+
+    private_ok = to_json(
+        G_private,
+        communities_private,
+        private_path,
+        force=force,
+        built_at_commit=built_at_commit,
+    )
+    shared_ok = to_json(
+        G_shared,
+        communities_shared,
+        shared_path,
+        force=force,
+        built_at_commit=built_at_commit,
+    )
+    return private_ok, shared_ok
 
 def _obsidian_tag(name: str) -> str:
     """Sanitize a community name for use as an Obsidian tag.

@@ -993,6 +993,39 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
             f"Consider running on a subfolder."
         )
 
+    # Privacy classification: collect all accepted file paths and classify them.
+    # This runs AFTER .graphifyignore / sensitive filtering so privacy.py only
+    # sees paths that the pipeline has already decided to include.
+    # Decision: in legacy mode we set privacy_map=None (not omit the key) so
+    # callers can uniformly use result.get("privacy_map") without KeyError.
+    # Lazy import avoids the circular dependency: privacy.py imports from detect.py
+    # for _VCS_MARKERS / _find_vcs_root / _parse_gitignore_line, so a module-level
+    # import of privacy from detect would create a circular reference.
+    from graphify import privacy as _privacy  # noqa: PLC0415 (intentional lazy import)
+    all_accepted: list[Path] = [
+        Path(p)
+        for file_list in files.values()
+        for p in file_list
+    ]
+    if _privacy.is_legacy_mode(root):
+        privacy_map: "dict | None" = None
+    else:
+        raw_map = _privacy.classify_paths(all_accepted, root)
+        # Re-key with paths RELATIVE to `root` so downstream lookups against
+        # node.source_file (which is stored relative in graph.json) match.
+        # classify_paths returns keys = str(input_path); we need str(relative).
+        root_resolved = Path(root).resolve()
+        rekeyed: dict[str, str] = {}
+        for abs_key, bucket in raw_map.items():
+            try:
+                rel = Path(abs_key).resolve().relative_to(root_resolved)
+                rekeyed[str(rel)] = bucket
+            except ValueError:
+                # Path not under root (shouldn't happen in practice) — keep absolute as fallback.
+                rekeyed[abs_key] = bucket
+        # Empty map (no files or all filtered) is treated as legacy — no split.
+        privacy_map = rekeyed if rekeyed else None
+
     return {
         "files": {k.value: v for k, v in files.items()},
         "total_files": total_files,
@@ -1002,6 +1035,7 @@ def detect(root: Path, *, follow_symlinks: bool | None = None, google_workspace:
         "skipped_sensitive": skipped_sensitive,
         "graphifyignore_patterns": len(ignore_patterns),
         "scan_root": str(root.resolve()),
+        "privacy_map": privacy_map,
     }
 
 
@@ -1018,10 +1052,37 @@ def _md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
+SCHEMA_VERSION = 2
+
+
+def _migrate_manifest(data: dict) -> dict:
+    """Migrate manifest schema v1 → v2 by stamping origin='private' (safest default)
+    on entries that do not have the origin key.  Idempotent: if schema_version >= 2,
+    no-op.
+
+    Args:
+        data: Raw manifest dict loaded from disk.
+
+    Returns:
+        The (possibly mutated) dict with schema_version=2 and origin fields set.
+    """
+    if data.get("schema_version", 1) == 1:
+        for path, entry in data.items():
+            if isinstance(entry, dict) and "mtime" in entry and "origin" not in entry:
+                entry["origin"] = "private"
+        data["schema_version"] = 2
+    return data
+
+
 def load_manifest(manifest_path: str = _MANIFEST_PATH) -> dict:
-    """Load the manifest from a previous run. Returns {} on any error."""
+    """Load the manifest from a previous run.
+
+    Runs _migrate_manifest() before returning so callers always receive a
+    schema-v2 dict.  Returns {} on any error.
+    """
     try:
-        return json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        data = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        return _migrate_manifest(data)
     except Exception:
         return {}
 
@@ -1031,6 +1092,8 @@ def save_manifest(
     manifest_path: str = _MANIFEST_PATH,
     *,
     kind: str = "both",
+    privacy_map: "dict[str, str] | None" = None,
+    root: "str | Path" = ".",
 ) -> None:
     """Save current file mtimes + content hashes for change detection.
 
@@ -1040,6 +1103,14 @@ def save_manifest(
     kind="semantic" — written by `graphify extract` after semantic extraction.
                       Stamps semantic_hash; preserves existing ast_hash.
     kind="both"     — full pipeline: stamps both hashes (default).
+
+    privacy_map     — when provided, each per-file entry gains an "origin" key
+                      ("private" or "shared").  When None (legacy mode), the
+                      origin key is omitted so existing consumers see no change.
+
+    schema_version  — written as 2 when privacy_map is provided; 1 otherwise
+                      (lazy upgrade: version only bumps when the new features are
+                      actively used, keeping legacy manifests byte-compatible).
     """
     existing = load_manifest(manifest_path)
 
@@ -1058,6 +1129,9 @@ def save_manifest(
     # deletions that detect_incremental() should treat as gone.
     manifest: dict[str, dict] = {}
     for f, entry in existing.items():
+        # Skip schema_version sentinel key (not a file entry)
+        if f == "schema_version":
+            continue
         normalised = _normalise_entry(entry)
         if normalised is None:
             continue
@@ -1086,9 +1160,21 @@ def save_manifest(
             else:
                 # Preserve semantic_hash only when content is unchanged
                 entry["semantic_hash"] = prev.get("semantic_hash", "") if h == prev.get("ast_hash", "") else ""
+            # Stamp origin when privacy_map is provided (new mode only).
+            if privacy_map is not None:
+                entry["origin"] = privacy_map.get(f, "private")  # default private by safety
             manifest[f] = entry
+
+    # Build the JSON payload.  schema_version=2 when privacy_map is active so
+    # load_manifest() knows to run _migrate_manifest(); otherwise omit it to
+    # stay byte-compatible with v0.8.18 readers.
+    output: dict = {}
+    if privacy_map is not None:
+        output["schema_version"] = 2
+    output.update(manifest)
+
     Path(manifest_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(manifest_path).write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    Path(manifest_path).write_text(json.dumps(output, indent=2), encoding="utf-8")
 
 
 def detect_incremental(
