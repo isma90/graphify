@@ -380,15 +380,6 @@ def is_legacy_mode(root: Path) -> bool:
     * No remote is configured in ``~/.graphify/config.toml`` for this repo
       path.
 
-    Note (STUB — Stage 2):
-        The ``~/.graphify/config.toml`` remote-lookup is not yet implemented.
-        This function currently determines legacy mode based solely on the
-        presence of overlay files.  When Stage 2 integrates config.toml
-        remote configuration, the third condition will be evaluated by
-        querying the config for an entry whose ``repo_path`` matches *root*.
-        Until then, absence of both overlay files is sufficient to return
-        ``True``.
-
     Args:
         root: The scan root directory.
 
@@ -402,25 +393,25 @@ def is_legacy_mode(root: Path) -> bool:
     if has_overlays:
         return False
 
-    # STUB: config.toml remote check not yet implemented (Stage 2).
-    # When implemented, return False if a remote is configured for root.
-    has_remote = _stub_has_remote_configured(root)
+    has_remote = _has_remote_configured(root)
 
     return not has_remote
 
 
-def _stub_has_remote_configured(root: Path) -> bool:  # noqa: ARG001
-    """Stub for Stage 2 config.toml remote lookup.
+def _has_remote_configured(root: Path) -> bool:
+    """Return True iff `root` has a configured remote in ~/.graphify/config.toml.
+
+    Used by is_legacy_mode() to detect Stage-2 config-driven remotes
+    (in addition to overlay files).
 
     Args:
-        root: Repository root path (unused until Stage 2).
+        root: Repository root path.
 
     Returns:
-        Always ``False`` until Stage 2 implements config.toml integration.
+        ``True`` when a matching ``[[remote]]`` entry exists in the config file.
     """
-    # TODO (Stage 2): read ~/.graphify/config.toml and check for a [remote]
-    # entry whose repo_path matches root.  Return True if found.
-    return False
+    from graphify.config import find_remote
+    return find_remote(root) is not None
 
 
 @lru_cache(maxsize=512)

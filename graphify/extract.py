@@ -8,8 +8,11 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Any
+from typing import TYPE_CHECKING, Callable, Any
 from .cache import load_cached, save_cached
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 _RECURSION_LIMIT = 10_000
 
@@ -8496,6 +8499,92 @@ def split_extraction_by_origin(result: dict, privacy_map: dict[str, str]) -> tup
     }
 
     return private_dict, shared_dict
+
+
+def compute_bucket_migration_prune_ids(
+    old_manifest: dict,
+    new_privacy_map: dict[str, str],
+    existing_graph: "nx.Graph",
+) -> list[str]:
+    """Return node IDs in *existing_graph* whose source_file has either:
+
+    (a) been removed from the corpus (no entry in *new_privacy_map*), OR
+    (b) migrated to the other bucket (manifest origin != current bucket
+        derived from *new_privacy_map*).
+
+    The caller passes the returned list to ``build.build_merge(prune_ids=...)``
+    so the merged graph no longer carries stale nodes from files that left this
+    bucket between extracts.
+
+    Algorithm:
+
+    For each node in *existing_graph*:
+
+    1. Skip nodes without a ``source_file`` attribute — these are synthetic nodes
+       created from cross-file edges and are not tied to a single file.
+    2. Determine the node's *current* bucket from its ``origin`` attribute (stamped
+       by Stage 1 on every node).  If ``origin`` is absent (legacy v1 data), fall
+       back to the ``old_manifest["files"][source_file]["origin"]`` entry with a
+       hard default of ``"private"``.
+    3. Look up the file's *new* bucket in ``new_privacy_map``.  If the file is
+       absent (deleted from corpus) → prune.  If the new bucket differs from the
+       current bucket → prune (bucket migration).
+
+    Args:
+        old_manifest: A schema-v2 manifest dict (see ``graphify/detect.py``,
+            ``SCHEMA_VERSION=2``).  Top-level shape::
+
+                {
+                    "schema_version": 2,
+                    "files": {
+                        "<relpath>": {"origin": "private" | "shared", ...},
+                        ...
+                    },
+                    ...
+                }
+
+            Entries without an ``"origin"`` field are treated as ``"private"``
+            (lazy v1→v2 migration default).
+        new_privacy_map: Mapping from relative file path → bucket
+            (``"private"`` or ``"shared"``) for the *current* extraction.  Paths
+            are relative to the scan root, matching ``node.source_file`` (which is
+            also relative in ``graph.json`` — confirmed by the Stage 1 bugfix in
+            ``detect.py``).
+        existing_graph: The current on-disk graph for **one** bucket
+            (e.g. ``graph-private.json`` loaded as ``nx.Graph``).  This function
+            is called once per bucket.
+
+    Returns:
+        A sorted list of node IDs from *existing_graph* that should be pruned
+        before ``build_merge`` runs.  The list is sorted for determinism and
+        will never contain duplicates (each node ID appears at most once in a
+        well-formed graph).
+    """
+    manifest_files: dict[str, dict] = old_manifest.get("files", {})
+    prune: list[str] = []
+
+    for node_id, attrs in existing_graph.nodes(data=True):
+        src: str | None = attrs.get("source_file")
+        if not src:
+            # Synthetic node (cross-file edge endpoint) — never prune.
+            continue
+
+        # Determine the current bucket this node belongs to.
+        current_origin: str | None = attrs.get("origin")
+        if not current_origin:
+            # Legacy v1 node: fall back to the manifest, default "private".
+            current_origin = manifest_files.get(src, {}).get("origin", "private")
+
+        # Look up what bucket the file belongs to after the current extraction.
+        new_origin: str | None = new_privacy_map.get(src)
+        if new_origin is None:
+            # File was deleted from the corpus entirely.
+            prune.append(node_id)
+        elif new_origin != current_origin:
+            # File migrated to the other bucket.
+            prune.append(node_id)
+
+    return sorted(prune)
 
 
 if __name__ == "__main__":

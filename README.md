@@ -303,6 +303,33 @@ graphify-out/cost.json        # local only
 3. Run `graphify hook install` to auto-rebuild after each commit (AST only, no API cost). This also sets up a git merge driver so `graph.json` is never left with conflict markers — two devs committing in parallel get their graphs union-merged automatically.
 4. When docs or papers change, run `/graphify --update` to refresh those nodes.
 
+### Private vs. shared graph (split mode)
+
+For repos that mix code you want to share with teammates and material you want to keep local (scratch notes, secrets, half-baked experiments), graphify can produce **two** graphs side-by-side: `graph-private.json` (stays on your machine) and `graph-shared.json` (travels via your existing git remote).
+
+```bash
+# one-time setup — creates .graphifyshared / .graphifyprivate overlays,
+# writes the per-repo entry to ~/.graphify/config.toml, and installs a
+# git merge driver so concurrent edits to graph-shared.json merge cleanly.
+graphify init-sharing --default-remote git@github.com:org/repo.git .
+
+# mark which paths are shared (gitignore-style patterns)
+echo "src/**" >> .graphifyshared
+echo "docs/**" >> .graphifyshared
+
+# extract — produces graph-private.json + graph-shared.json
+graphify extract .
+
+# publish your changes to the shared graph
+graphify push
+
+# pull teammates' changes (three-way merged via three_way_merge_nodes;
+# conflicts written to graphify-out/.graphify_shared_conflicts.json)
+graphify pull
+```
+
+The mental model: any file matched by `.graphifyshared` goes into the shared bucket; everything else stays private. Cross-bucket edges and hyperedges that touch any private node go to the **private** graph only — the shared graph never exposes private structure. Repos without overlays or a configured remote continue to behave exactly like 0.8.18 (single `graph.json`, byte-identical).
+
 ---
 
 ## Using the graph directly

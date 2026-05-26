@@ -291,6 +291,24 @@ def init_sharing(
         label="graphify-out/.gitignore",
     )
 
+    # Persist the default remote URL to ~/.graphify/config.toml (Stage 2).
+    # The comment-line write in .graphifyshared above is kept for human
+    # readability; the config entry is the machine-readable source of truth.
+    if default_remote:
+        from graphify.config import upsert_remote
+        upsert_remote(root, default_remote)
+
+    # Auto-install the git merge driver when root is inside a git working tree.
+    from graphify.privacy import _find_vcs_root
+    vcs_root = _find_vcs_root(root)
+    if vcs_root is not None:
+        try:
+            from graphify.git_integration import install_merge_driver
+            if install_merge_driver(root):
+                print("[graphify init-sharing] installed git merge driver for graph-shared.json")
+        except RuntimeError as e:
+            print(f"[graphify init-sharing] warning: could not install merge driver: {e}")
+
     return {
         "shared": shared_path,
         "private": private_path,

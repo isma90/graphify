@@ -2,6 +2,20 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.9.0 (2026-05-26)
+
+Stage 2 of the private/shared graph feature: the shared graph now syncs across teammates via the corpus's existing git remote, with conflicts auto-resolved by a registered git merge driver that delegates to `three_way_merge_nodes`. Private graph never leaves the machine. Legacy mode (single `graph.json`) is byte-identical to 0.8.18 for repos without overlays or a configured remote.
+
+- Feat: `graphify push` / `graphify pull` — sync `graph-shared.json` to/from the repo's git remote. `push` writes a commit to the shared branch (default `graphify/shared`) via git plumbing **without touching the user's working tree**; `pull` fetches, runs `three_way_merge_nodes(base, ours, theirs)`, writes the merged graph, and records conflicts to `graphify-out/.graphify_shared_conflicts.json` for manual review.
+- Feat: `~/.graphify/config.toml` reader — per-repo remote configuration in a global config file, keyed by absolute resolved `repo_path`. Override location via `GRAPHIFY_CONFIG` env var.
+- Feat: `graphify remote add <url> [--branch BR] [--shared-path PATH] [--remote-name NAME]`, `graphify remote remove`, `graphify remote list` subcommands manage the config.toml entries.
+- Feat: `graphify install-merge-driver` / `graphify uninstall-merge-driver` register a `merge=graphify-shared` driver in `.git/config` + `.gitattributes` so that `git pull` / `git merge` on `graph-shared.json` resolves cleanly via the existing `graphify merge-driver` subcommand.
+- Feat: `graphify init-sharing --default-remote <url>` now persists the URL to `~/.graphify/config.toml` AND auto-installs the merge driver when run inside a git repo (idempotent; silent re-runs). Non-git roots skip merge-driver install silently.
+- Feat: `is_legacy_mode` recognises config-driven remotes — a repo with no overlays but with a remote entry in config.toml is no longer treated as legacy. The "STUB — Stage 2" path in `privacy.py` is now fully implemented.
+- Perf: split-mode `graphify extract` now does incremental merge against existing `graph-private.json` and `graph-shared.json` instead of full rebuild — parity with legacy-mode performance. `GRAPHIFY_FORCE=1` forces full rebuild as before. Files that migrate between buckets (private↔shared) have their old-bucket nodes pruned via `build_merge(prune_ids=...)`.
+- Deps: `tomli>=2.0` added as a conditional dep for Python `< 3.11` (stdlib `tomllib` used on 3.11+).
+- Tests: +73 net (1414 passing total). New: `tests/test_config.py` (19), `tests/test_git_integration.py` (17), `tests/test_incremental_split.py` (13+ wiring), `tests/test_push_pull.py` (end-to-end via tmp bare git remote). Extended: `tests/test_privacy.py` (config-driven legacy mode), `tests/test_migrate.py` (config + merge-driver auto-install), `tests/test_cli_subcommands.py` (remote subcommands).
+
 ## 0.8.18 (2026-05-24)
 
 - Fix: post-commit hook now updates graph after delete-only commits — shrink-guard is bypassed when `changed_paths` contains explicit deletions, preventing stale nodes from accumulating indefinitely (#1000)

@@ -303,3 +303,72 @@ def test_resolve_author_returns_email_and_name_for_tracked_file(tmp_path):
     assert isinstance(result, dict)
     assert result.get("email") == "tester@example.com"
     assert result.get("display_name") == "Test Author"
+
+
+# ---------------------------------------------------------------------------
+# D2 — is_legacy_mode with config.toml remote (Stage 2)
+# ---------------------------------------------------------------------------
+
+
+def test_is_legacy_mode_false_when_config_has_remote(tmp_path, monkeypatch):
+    """is_legacy_mode is False when a remote is registered in config.toml,
+    even with no overlay files."""
+    import graphify.config as cfg
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    root = _make_repo(tmp_path, with_git=True)
+    # No overlays — legacy mode would normally be True here.
+    assert not (root / ".graphifyshared").exists()
+    assert not (root / ".graphifyprivate").exists()
+
+    cfg.upsert_remote(root, "git@example.com:foo/bar.git", path=cfg_file)
+
+    assert is_legacy_mode(root) is False
+
+
+def test_is_legacy_mode_true_when_other_repo_in_config(tmp_path, monkeypatch):
+    """Config has entry for repo B only: A is legacy-mode, B is not."""
+    import graphify.config as cfg
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    repo_a = tmp_path / "repo_a"
+    repo_a.mkdir()
+    (repo_a / ".git").mkdir()
+
+    repo_b = tmp_path / "repo_b"
+    repo_b.mkdir()
+    (repo_b / ".git").mkdir()
+
+    # Register only repo B.
+    cfg.upsert_remote(repo_b, "git@example.com:org/b.git", path=cfg_file)
+
+    assert is_legacy_mode(repo_a) is True
+    assert is_legacy_mode(repo_b) is False
+
+
+def test_is_legacy_mode_false_when_overlay_and_config_both_present(tmp_path, monkeypatch):
+    """Sanity: both a .graphifyshared overlay and a config remote → not legacy."""
+    import graphify.config as cfg
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    root = _make_repo(tmp_path, with_git=True, shared_content="src/**\n")
+    cfg.upsert_remote(root, "git@example.com:org/repo.git", path=cfg_file)
+
+    assert is_legacy_mode(root) is False
+
+
+def test_is_legacy_mode_true_when_no_overlay_no_config(tmp_path, monkeypatch):
+    """Baseline (unchanged from Stage 1): no overlay + no config → legacy."""
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    root = _make_repo(tmp_path, with_git=True)
+    # cfg_file intentionally not written — no remote configured.
+
+    assert is_legacy_mode(root) is True

@@ -3350,11 +3350,98 @@ def main() -> None:
 
             private_extr, shared_extr = _split_extraction(merged, privacy_map)
 
-            # Build each bucket graph independently.
-            # Incremental merge against split graphs is not yet implemented
-            # (Stage 2); fall back to full rebuild from the split extraction.
-            G_private = _build([private_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
-            G_shared = _build([shared_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+            # --- D6b: incremental merge for split-mode (Stage 2) ---
+            # Mirror legacy mode: use build_merge when split output already
+            # exists, unless the user forces a full rebuild via GRAPHIFY_FORCE.
+            force_full_rebuild = os.environ.get("GRAPHIFY_FORCE", "").lower() in ("1", "true", "yes")
+            _out_dir = graphify_out
+            _priv_path = _out_dir / "graph-private.json"
+            _shar_path = _out_dir / "graph-shared.json"
+
+            # Load the previous manifest so we can compute bucket-migration prune IDs.
+            from graphify.detect import load_manifest as _load_manifest
+            _old_manifest = _load_manifest(str(manifest_path))
+
+            # Helper: compute prune_sources for a bucket — files that were in
+            # the previous manifest (with matching origin) but are no longer
+            # present in the current extraction for that bucket.
+            def _compute_bucket_prune_sources(
+                old_mf: dict,
+                current_extr: dict,
+                bucket: str,
+            ) -> list[str]:
+                """Return file paths that disappeared from *bucket* since last run.
+
+                A file is "gone from bucket" if it existed in the old manifest
+                with origin==bucket and is no longer present as a source_file
+                in the current extraction result for that bucket.
+                """
+                old_files = old_mf.get("files", {})
+                old_bucket_files = {
+                    path
+                    for path, meta in old_files.items()
+                    if (meta.get("origin") if isinstance(meta, dict) else None) == bucket
+                }
+                current_source_files = {
+                    n.get("source_file", "")
+                    for n in current_extr.get("nodes", [])
+                }
+                current_source_files.discard("")
+                return sorted(old_bucket_files - current_source_files)
+
+            from networkx.readwrite import json_graph as _jg_split
+
+            def _load_graph_for_split(p: "Path"):
+                """Load a split-bucket graph JSON → nx.Graph."""
+                data = json.loads(p.read_text(encoding="utf-8"))
+                try:
+                    return _jg_split.node_link_graph(data, edges="links")
+                except TypeError:
+                    return _jg_split.node_link_graph(data)
+
+            # --- PRIVATE bucket ---
+            if _priv_path.exists() and not force_full_rebuild:
+                _G_priv_existing = _load_graph_for_split(_priv_path)
+                from graphify.extract import compute_bucket_migration_prune_ids as _prune_ids_fn
+                _prune_priv = _prune_ids_fn(_old_manifest, privacy_map, _G_priv_existing)
+                _prune_priv_sources = _compute_bucket_prune_sources(
+                    _old_manifest, private_extr, "private"
+                )
+                G_private = _build_merge(
+                    [private_extr],
+                    graph_path=_priv_path,
+                    prune_sources=_prune_priv_sources or None,
+                    prune_ids=_prune_priv or None,
+                    directed=False,
+                    dedup=True,
+                    dedup_llm_backend=dedup_backend,
+                    root=target,
+                )
+                print("[graphify] incremental merge against existing graph-private.json")
+            else:
+                G_private = _build([private_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
+
+            # --- SHARED bucket ---
+            if _shar_path.exists() and not force_full_rebuild:
+                _G_shar_existing = _load_graph_for_split(_shar_path)
+                from graphify.extract import compute_bucket_migration_prune_ids as _prune_ids_fn
+                _prune_shar = _prune_ids_fn(_old_manifest, privacy_map, _G_shar_existing)
+                _prune_shar_sources = _compute_bucket_prune_sources(
+                    _old_manifest, shared_extr, "shared"
+                )
+                G_shared = _build_merge(
+                    [shared_extr],
+                    graph_path=_shar_path,
+                    prune_sources=_prune_shar_sources or None,
+                    prune_ids=_prune_shar or None,
+                    directed=False,
+                    dedup=True,
+                    dedup_llm_backend=dedup_backend,
+                    root=target,
+                )
+                print("[graphify] incremental merge against existing graph-shared.json")
+            else:
+                G_shared = _build([shared_extr], dedup=True, dedup_llm_backend=dedup_backend, root=target)
 
             if G_private.number_of_nodes() == 0 and G_shared.number_of_nodes() == 0:
                 print(
@@ -3641,6 +3728,249 @@ def main() -> None:
             print("[graphify migrate-to-shared] Aborted.")
         else:
             print(f"[graphify migrate-to-shared] status: {_status}")
+
+    # ----------------------------------------------------------------
+    # D4: Stage-2 git-sync subcommands
+    # ----------------------------------------------------------------
+
+    elif cmd == "push":
+        import argparse as _argparse
+        from datetime import datetime as _datetime
+        _parser = _argparse.ArgumentParser(prog="graphify push")
+        _parser.add_argument("--branch", default=None, help="Override branch from config")
+        _parser.add_argument("--message", default=None, help="Commit message")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root_path = Path(_args.root).resolve()
+        from graphify import config as _config
+        from graphify import git_integration as _git_integration
+        _cfg = _config.find_remote(_root_path)
+        if _cfg is None:
+            print(
+                f"[graphify push] no remote configured for {_root_path}. "
+                f"Run: graphify remote add <url> {_root_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _push_branch = _args.branch or _cfg.branch
+        _shared_file = _root_path / _cfg.shared_path
+        if not _shared_file.exists():
+            print(
+                f"[graphify push] {_shared_file} does not exist. "
+                "Run `graphify extract` first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _parent_sha = _git_integration.current_shared_head(
+            _root_path, branch=_push_branch, remote_name=_cfg.remote_name
+        )
+        _push_message = (
+            _args.message
+            or f"graphify shared graph @ {_datetime.now().isoformat(timespec='seconds')}"
+        )
+        _new_sha = _git_integration.commit_shared_via_plumbing(
+            _root_path,
+            branch=_push_branch,
+            shared_path=_cfg.shared_path,
+            message=_push_message,
+            parent_sha=_parent_sha,
+        )
+        _git_integration.push_branch(
+            _root_path, branch=_push_branch, remote_name=_cfg.remote_name
+        )
+        _watermark_path = _root_path / "graphify-out" / ".graphify_shared_base"
+        _watermark_path.parent.mkdir(parents=True, exist_ok=True)
+        _watermark_path.write_text(_new_sha + "\n", encoding="utf-8")
+        print(f"[graphify push] pushed {_new_sha[:8]} to {_cfg.remote_name}/{_push_branch}")
+        sys.exit(0)
+
+    elif cmd == "pull":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify pull")
+        _parser.add_argument("--branch", default=None, help="Override branch from config")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root_path = Path(_args.root).resolve()
+        from graphify import config as _config
+        from graphify import git_integration as _git_integration
+        _cfg = _config.find_remote(_root_path)
+        if _cfg is None:
+            print(
+                f"[graphify pull] no remote configured for {_root_path}. "
+                f"Run: graphify remote add <url> {_root_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        _pull_branch = _args.branch or _cfg.branch
+        _remote_sha = _git_integration.fetch_shared(
+            _root_path, branch=_pull_branch, remote_name=_cfg.remote_name
+        )
+        if _remote_sha is None:
+            print(
+                f"[graphify pull] remote branch {_cfg.remote_name}/{_pull_branch} "
+                "does not exist yet. Nothing to pull."
+            )
+            sys.exit(0)
+
+        def _empty_graph_dict() -> dict:
+            """Return the minimal JSON shape for an empty graph (mirrors to_json output)."""
+            return {
+                "directed": False,
+                "multigraph": False,
+                "graph": {},
+                "nodes": [],
+                "links": [],
+            }
+
+        _theirs_raw = _git_integration.read_shared_at_ref(
+            _root_path, _remote_sha, shared_path=_cfg.shared_path
+        )
+        if _theirs_raw is None:
+            print(
+                f"[graphify pull] warning: {_cfg.shared_path} absent at {_remote_sha[:8]}",
+                file=sys.stderr,
+            )
+            _pull_watermark = _root_path / "graphify-out" / ".graphify_shared_base"
+            _pull_watermark.parent.mkdir(parents=True, exist_ok=True)
+            _pull_watermark.write_text(_remote_sha + "\n", encoding="utf-8")
+            sys.exit(0)
+
+        _shared_file = _root_path / _cfg.shared_path
+        if _shared_file.exists():
+            _ours_raw = json.loads(_shared_file.read_text(encoding="utf-8"))
+        else:
+            _ours_raw = _empty_graph_dict()
+
+        _pull_watermark_path = _root_path / "graphify-out" / ".graphify_shared_base"
+        _base_sha = (
+            _pull_watermark_path.read_text(encoding="utf-8").strip()
+            if _pull_watermark_path.exists()
+            else None
+        )
+        if _base_sha:
+            _base_raw = (
+                _git_integration.read_shared_at_ref(
+                    _root_path, _base_sha, shared_path=_cfg.shared_path
+                )
+                or _empty_graph_dict()
+            )
+        else:
+            _base_raw = _empty_graph_dict()
+
+        from networkx.readwrite import json_graph as _jg_pull
+        from graphify.build import three_way_merge_nodes as _three_way_merge_pull
+
+        def _graph_from_dict(d: dict):
+            try:
+                return _jg_pull.node_link_graph(d, edges="links")
+            except TypeError:
+                return _jg_pull.node_link_graph(d)
+
+        _PULL_MAX_NODES = 100_000
+        _G_base = _graph_from_dict(_base_raw)
+        _G_ours = _graph_from_dict(_ours_raw)
+        _G_theirs = _graph_from_dict(_theirs_raw)
+
+        _G_merged_pull, _pull_conflicts = _three_way_merge_pull(
+            _G_base, _G_ours, _G_theirs, max_nodes=_PULL_MAX_NODES, dedup=True
+        )
+
+        _shared_file.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _out_data_pull = _jg_pull.node_link_data(_G_merged_pull, edges="links")
+        except TypeError:
+            _out_data_pull = _jg_pull.node_link_data(_G_merged_pull)
+        _shared_file.write_text(json.dumps(_out_data_pull, indent=2), encoding="utf-8")
+
+        if _pull_conflicts:
+            _conflicts_path = _root_path / "graphify-out" / ".graphify_shared_conflicts.json"
+            _conflicts_path.write_text(
+                json.dumps(_pull_conflicts, indent=2, default=str), encoding="utf-8"
+            )
+            print(
+                f"[graphify pull] {len(_pull_conflicts)} conflict(s) written to "
+                ".graphify_shared_conflicts.json",
+                file=sys.stderr,
+            )
+
+        _pull_watermark_path.parent.mkdir(parents=True, exist_ok=True)
+        _pull_watermark_path.write_text(_remote_sha + "\n", encoding="utf-8")
+        print(
+            f"[graphify pull] merged {_remote_sha[:8]} from "
+            f"{_cfg.remote_name}/{_pull_branch} → "
+            f"{_G_merged_pull.number_of_nodes()} nodes"
+        )
+        sys.exit(0)
+
+    elif cmd == "remote":
+        _remote_sub = sys.argv[2] if len(sys.argv) > 2 else None
+        from graphify import config as _config
+        if _remote_sub == "add":
+            import argparse as _argparse
+            _parser = _argparse.ArgumentParser(prog="graphify remote add")
+            _parser.add_argument("url", help="Remote git URL")
+            _parser.add_argument("--branch", default=None)
+            _parser.add_argument("--shared-path", default=None, dest="shared_path")
+            _parser.add_argument("--remote-name", default=None, dest="remote_name")
+            _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+            _args = _parser.parse_args(sys.argv[3:])
+            _root_path = Path(_args.root).resolve()
+            _config.upsert_remote(
+                _root_path,
+                _args.url,
+                branch=_args.branch,
+                shared_path=_args.shared_path,
+                remote_name=_args.remote_name,
+            )
+            print(f"[graphify remote] added {_args.url} for {_root_path}")
+        elif _remote_sub == "remove":
+            import argparse as _argparse
+            _parser = _argparse.ArgumentParser(prog="graphify remote remove")
+            _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+            _args = _parser.parse_args(sys.argv[3:])
+            _root_path = Path(_args.root).resolve()
+            if _config.remove_remote(_root_path):
+                print(f"[graphify remote] removed entry for {_root_path}")
+            else:
+                print(f"[graphify remote] no entry found for {_root_path}", file=sys.stderr)
+                sys.exit(1)
+        elif _remote_sub == "list":
+            for _rc in _config.load_config():
+                _line = (
+                    f"{_rc.repo_path}  →  {_rc.url or '(no url set)'}  "
+                    f"[{_rc.remote_name}/{_rc.branch}]"
+                )
+                print(_line)
+        else:
+            print(
+                "Usage: graphify remote {add|remove|list} ...",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    elif cmd == "install-merge-driver":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify install-merge-driver")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root_path = Path(_args.root).resolve()
+        from graphify.git_integration import install_merge_driver as _install_md
+        if _install_md(_root_path):
+            print(f"[graphify] installed merge driver in {_root_path}")
+        else:
+            print(f"[graphify] merge driver already installed in {_root_path}")
+
+    elif cmd == "uninstall-merge-driver":
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify uninstall-merge-driver")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _root_path = Path(_args.root).resolve()
+        from graphify.git_integration import uninstall_merge_driver as _uninstall_md
+        if _uninstall_md(_root_path):
+            print(f"[graphify] uninstalled merge driver from {_root_path}")
+        else:
+            print(f"[graphify] no merge driver installed at {_root_path}")
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.

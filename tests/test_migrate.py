@@ -350,3 +350,155 @@ def test_manifest_v1_to_v2_idempotent() -> None:
     assert "shared" in origins, (
         f"Idempotent migration must preserve existing origin='shared', got origins={origins}"
     )
+
+
+# ---------------------------------------------------------------------------
+# D5 — init_sharing wires config.toml remote + merge-driver (Stage 2)
+# ---------------------------------------------------------------------------
+
+
+def test_init_sharing_writes_config_when_default_remote_given(tmp_path: Path, monkeypatch) -> None:
+    """init_sharing with default_remote writes an entry to the config file."""
+    import graphify.config as cfg
+    from graphify.migrate import init_sharing
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    init_sharing(repo, interactive=False, default_remote="ssh://example/foo.git")
+
+    entries = cfg.load_config(cfg_file)
+    assert len(entries) == 1, f"Expected 1 config entry, got {len(entries)}: {entries}"
+    entry = entries[0]
+    assert entry.url == "ssh://example/foo.git"
+    assert entry.repo_path.resolve() == repo.resolve()
+
+
+def test_init_sharing_does_not_write_config_when_no_default_remote(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """init_sharing without default_remote must not create the config file."""
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    from graphify.migrate import init_sharing
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    init_sharing(repo, interactive=False)
+
+    # Config file should not exist (or be empty / have no remote entries).
+    import graphify.config as cfg
+    entries = cfg.load_config(cfg_file)
+    assert entries == [], f"Expected no config entries, got {entries}"
+
+
+def test_init_sharing_installs_merge_driver_in_git_repo(tmp_path: Path, monkeypatch) -> None:
+    """init_sharing inside a git repo registers the git merge driver."""
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git binary not available")
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    from graphify.migrate import init_sharing
+    import graphify.git_integration as gi
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    init_sharing(repo, interactive=False)
+
+    assert gi.is_merge_driver_installed(repo) is True
+
+
+def test_init_sharing_skips_merge_driver_outside_git_repo(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """init_sharing on a plain directory (no git) must not install merge driver
+    and must not raise."""
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    from graphify.migrate import init_sharing
+
+    # Plain directory — no git init.
+    repo = tmp_path / "plain_repo"
+    repo.mkdir()
+
+    init_sharing(repo, interactive=False)
+
+    # .gitattributes must not have been created.
+    assert not (repo / ".gitattributes").exists(), (
+        ".gitattributes must not be created outside a git repo"
+    )
+    captured = capsys.readouterr()
+    assert "installed git merge driver" not in captured.out
+
+
+def test_init_sharing_merge_driver_install_is_idempotent(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Second call to init_sharing must not re-print the merge-driver message."""
+    import shutil
+    if shutil.which("git") is None:
+        pytest.skip("git binary not available")
+
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    from graphify.migrate import init_sharing
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    # First call — merge driver not yet installed; should print.
+    init_sharing(repo, interactive=False)
+    first_out = capsys.readouterr().out
+    assert "installed git merge driver" in first_out, (
+        f"First init_sharing must print merge-driver message, got: {first_out!r}"
+    )
+
+    # Second call — already installed; must NOT print the message.
+    init_sharing(repo, interactive=False)
+    second_out = capsys.readouterr().out
+    assert "installed git merge driver" not in second_out, (
+        f"Second init_sharing must not re-print merge-driver message, got: {second_out!r}"
+    )
+
+
+def test_init_sharing_resilient_to_merge_driver_failure(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """If install_merge_driver raises RuntimeError, init_sharing must not crash
+    and must print the warning. Overlay files must still be created."""
+    cfg_file = tmp_path / "cfg.toml"
+    monkeypatch.setenv("GRAPHIFY_CONFIG", str(cfg_file))
+
+    import graphify.git_integration as gi
+    monkeypatch.setattr(gi, "install_merge_driver", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("test")))
+
+    from graphify.migrate import init_sharing
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    # Must not raise.
+    init_sharing(repo, interactive=False)
+
+    captured = capsys.readouterr()
+    assert "warning: could not install merge driver" in captured.out, (
+        f"Expected warning in stdout, got: {captured.out!r}"
+    )
+    # Overlays must still be written.
+    assert (repo / ".graphifyshared").exists(), ".graphifyshared must exist despite merge-driver error"

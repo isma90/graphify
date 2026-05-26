@@ -172,3 +172,124 @@ def test_cli_migrate_to_shared_non_interactive(tmp_path: Path) -> None:
     assert not (out_dir / "graph.json").exists(), (
         "Legacy graph.json must be gone after migration"
     )
+
+
+# ---------------------------------------------------------------------------
+# D4: remote add / list / remove
+# ---------------------------------------------------------------------------
+
+
+def test_remote_add_then_list_then_remove(tmp_path: Path) -> None:
+    """Full round-trip: remote add, list, then remove — isolated via GRAPHIFY_CONFIG."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    config_file = tmp_path / "graphify_config.toml"
+    env = {**os.environ, "GRAPHIFY_CONFIG": str(config_file), "PYTHONUNBUFFERED": "1"}
+
+    # add
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "add",
+         "git@github.com:org/test.git", str(repo)],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, f"remote add failed: {proc.stderr}"
+    assert "added" in proc.stdout.lower() or "git@github.com" in proc.stdout
+
+    # list
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "list"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, f"remote list failed: {proc.stderr}"
+    assert str(repo) in proc.stdout
+    assert "git@github.com:org/test.git" in proc.stdout
+
+    # remove
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "remove", str(repo)],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, f"remote remove failed: {proc.stderr}"
+
+    # list again — should be empty
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "list"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0
+    assert str(repo) not in proc.stdout
+
+
+def test_remote_add_with_branch_and_shared_path_overrides(tmp_path: Path) -> None:
+    """--branch and --shared-path overrides are written and reflected in list + find_remote."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+    config_file = tmp_path / "graphify_config.toml"
+    env = {**os.environ, "GRAPHIFY_CONFIG": str(config_file), "PYTHONUNBUFFERED": "1"}
+
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "add",
+         "git@github.com:org/overrides.git", str(repo),
+         "--branch", "myteam/shared",
+         "--shared-path", "custom-out/shared.json"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0, f"remote add failed: {proc.stderr}"
+
+    # Verify via list
+    proc = subprocess.run(
+        [sys.executable, "-m", "graphify", "remote", "list"],
+        capture_output=True, text=True, env=env,
+    )
+    assert proc.returncode == 0
+    assert "myteam/shared" in proc.stdout
+
+    # Verify via Python API using the same config path
+    import importlib
+    from graphify import config as _cfg_mod
+    cfg = _cfg_mod.find_remote(repo, path=config_file)
+    assert cfg is not None, "find_remote should return entry"
+    assert cfg.branch == "myteam/shared"
+    assert cfg.shared_path == "custom-out/shared.json"
+
+
+# ---------------------------------------------------------------------------
+# D4: install-merge-driver / uninstall-merge-driver
+# ---------------------------------------------------------------------------
+
+
+def test_install_merge_driver_idempotent_cli(tmp_path: Path) -> None:
+    """install-merge-driver succeeds; second call reports 'already installed'."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    proc = _run_cli(["install-merge-driver", str(repo)])
+    assert proc.returncode == 0, f"first install failed: {proc.stderr}"
+    assert "installed" in proc.stdout.lower()
+    assert "already" not in proc.stdout.lower()
+
+    # Second call: idempotent — should report already installed
+    proc2 = _run_cli(["install-merge-driver", str(repo)])
+    assert proc2.returncode == 0, f"second install failed: {proc2.stderr}"
+    assert "already" in proc2.stdout.lower()
+
+
+def test_uninstall_merge_driver_cli(tmp_path: Path) -> None:
+    """install then uninstall via CLI — uninstall reports success."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init(repo)
+
+    _run_cli(["install-merge-driver", str(repo)])
+
+    proc = _run_cli(["uninstall-merge-driver", str(repo)])
+    assert proc.returncode == 0, f"uninstall failed: {proc.stderr}"
+    assert "uninstalled" in proc.stdout.lower()
+
+    # Second uninstall should report nothing to remove
+    proc2 = _run_cli(["uninstall-merge-driver", str(repo)])
+    assert proc2.returncode == 0
+    assert "no merge driver" in proc2.stdout.lower()
