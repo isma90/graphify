@@ -4148,10 +4148,21 @@ def main() -> None:
                 "base_schedule": "0 3 * * *",
                 "template": "templates/sleep_3_prune.md",
                 "context_from": "sleep_2_nrem",
-                "budget_ratio": 0.20 / 3.30,
+                "budget_ratio": 0.20 / 8.30,
                 "default_budget_usd": 0.20,
             },
+            {
+                "name": "sleep_4_rem",
+                "base_schedule": "30 3 * * *",
+                "template": "templates/sleep_4_rem.md",
+                "context_from": "sleep_3_prune",
+                "budget_ratio": 5.00 / 8.30,
+                "default_budget_usd": 5.00,
+            },
         ]
+        # Sprint 3 ratios re-balanced for 4 jobs (total $8.30 = $0.10 + $3.00 + $0.20 + $5.00)
+        _SLEEP_DEFAULT_JOBS[0]["budget_ratio"] = 0.10 / 8.30
+        _SLEEP_DEFAULT_JOBS[1]["budget_ratio"] = 3.00 / 8.30
 
         def _sleep_build_jobs(
             phases: list[int],
@@ -4918,6 +4929,1280 @@ def main() -> None:
                 f"[graphify decay]   {_conf_name} edges:  "
                 f"{_cs['decayed']} decayed, {_cs['removed']} removed"
             )
+        sys.exit(0)
+
+    elif cmd == "fuse":
+        # ------------------------------------------------------------------ #
+        # graphify fuse [--batch-size 30] [--backend X] [--dry-run]          #
+        #               [--max-fusions 50] [--force-split-mode-unsafe]        #
+        #               [<root>]                                               #
+        # KGGen iterative LLM clustering for synonym fusion.                  #
+        # Identifies synonym node clusters, builds fixed-point alias mapping, #
+        # rewrites hyperedges, contracts nodes, commits graph.json.           #
+        # ------------------------------------------------------------------ #
+        import argparse as _argparse
+        import random as _fuse_random
+        import subprocess as _fuse_sp
+        import time as _fuse_time
+        from networkx.readwrite import json_graph as _fuse_jg
+        import networkx as _fuse_nx
+
+        _fuse_parser = _argparse.ArgumentParser(
+            prog="graphify fuse",
+            description="KGGen iterative LLM clustering: synonym fusion of knowledge graph nodes.",
+        )
+        _fuse_parser.add_argument(
+            "--batch-size", type=int, default=30, dest="batch_size",
+            help="Number of nodes per LLM call (default: 30)",
+        )
+        _fuse_parser.add_argument(
+            "--backend", type=str, default=None,
+            help="LLM backend (overrides GRAPHIFY_BACKEND env; default: auto-detect)",
+        )
+        _fuse_parser.add_argument(
+            "--dry-run", action="store_true", dest="dry_run",
+            help="Report proposed clusters to stderr without mutating the graph",
+        )
+        _fuse_parser.add_argument(
+            "--max-fusions", type=int, default=50, dest="max_fusions",
+            help="Safety gate: abort if proposed fusions exceed this count (default: 50)",
+        )
+        _fuse_parser.add_argument(
+            "--force-split-mode-unsafe", action="store_true", dest="force_split_mode_unsafe",
+            help="Bypass split-mode refusal; operates only on legacy graph.json",
+        )
+        _fuse_parser.add_argument(
+            "root", nargs="?", default=".",
+            help="Repo root (default: cwd)",
+        )
+        _fuse_args = _fuse_parser.parse_args(sys.argv[2:])
+        _fuse_root = Path(_fuse_args.root).resolve()
+
+        # ---- Split-mode detection (mirrors decay pattern) ----------------- #
+        _fuse_is_split = False
+        try:
+            from graphify.privacy import load_overlays as _fuse_load_overlays
+            _fuse_overlays = _fuse_load_overlays(_fuse_root)
+            if _fuse_overlays.get("shared") or _fuse_overlays.get("private"):
+                _fuse_is_split = True
+        except Exception:
+            for _fuse_sentinel_name in (".graphifyshared", ".graphifyprivate"):
+                _fuse_check = _fuse_root
+                for _ in range(20):
+                    if (_fuse_check / _fuse_sentinel_name).exists():
+                        _fuse_is_split = True
+                        break
+                    _fuse_parent = _fuse_check.parent
+                    if _fuse_parent == _fuse_check:
+                        break
+                    _fuse_check = _fuse_parent
+                if _fuse_is_split:
+                    break
+
+        if not _fuse_is_split:
+            try:
+                from graphify.config import find_remote as _fuse_find_remote
+                if _fuse_find_remote(_fuse_root) is not None:
+                    _fuse_is_split = True
+            except Exception:
+                pass
+
+        if _fuse_is_split and not _fuse_args.force_split_mode_unsafe:
+            print(
+                "graphify fuse: split mode (overlays or configured remote) is not yet fully supported by the sleep cycle.\n"
+                "Tracking: https://github.com/safishamsi/graphify/issues/TBD-split-mode-sleep\n"
+                "Workaround: --force-split-mode-unsafe applies fuse to the legacy graph-out/graph.json only "
+                "(skipping graph-private.json / graph-shared.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _fuse_is_split and _fuse_args.force_split_mode_unsafe:
+            print(
+                "[graphify fuse] --force-split-mode-unsafe: split-mode files "
+                "(graph-private.json, graph-shared.json) NOT fused; only legacy graph.json processed.",
+                file=sys.stderr,
+            )
+
+        # ---- Load graph --------------------------------------------------- #
+        _fuse_graph_path = _fuse_root / "graphify-out" / "graph.json"
+        if not _fuse_graph_path.exists():
+            print(
+                f"graphify fuse: {_fuse_graph_path} does not exist. Run 'graphify extract' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _fuse_raw = json.loads(_fuse_graph_path.read_text(encoding="utf-8"))
+        if "links" not in _fuse_raw and "edges" in _fuse_raw:
+            _fuse_raw = dict(_fuse_raw, links=_fuse_raw["edges"])
+        try:
+            _fuse_G = _fuse_jg.node_link_graph(_fuse_raw, edges="links")
+        except TypeError:
+            _fuse_G = _fuse_jg.node_link_graph(_fuse_raw)
+
+        # ---- Build EXTRACTED-safe set ------------------------------------ #
+        # A node is EXTRACTED-safe if ANY incident edge has confidence==EXTRACTED.
+        # Such nodes have stable AST-derived identifiers and must never be fused.
+        _fuse_extracted_safe: set[str] = set()
+        for _fu, _fv, _fed in _fuse_G.edges(data=True):
+            if _fed.get("confidence") == "EXTRACTED":
+                _fuse_extracted_safe.add(str(_fu))
+                _fuse_extracted_safe.add(str(_fv))
+
+        # ---- Identify candidates ------------------------------------------ #
+        # Nodes with degree > 3 OR god-nodes (max_observed_degree > 20).
+        # Exclude EXTRACTED-safe nodes.
+        _fuse_god_nodes: set[str] = {
+            str(_n) for _n, _na in _fuse_G.nodes(data=True)
+            if _na.get("max_observed_degree", 0) > 20
+        }
+        _fuse_candidates: list[str] = [
+            str(_n) for _n in _fuse_G.nodes()
+            if (
+                _fuse_G.degree(_n) > 3 or str(_n) in _fuse_god_nodes
+            ) and str(_n) not in _fuse_extracted_safe
+        ]
+
+        # ---- Deterministic shuffle + batch -------------------------------- #
+        _fuse_rng = _fuse_random.Random(42)
+        _fuse_rng.shuffle(_fuse_candidates)
+        _fuse_batch_size = max(1, _fuse_args.batch_size)
+        _fuse_batches: list[list[str]] = [
+            _fuse_candidates[_i:_i + _fuse_batch_size]
+            for _i in range(0, len(_fuse_candidates), _fuse_batch_size)
+        ]
+
+        # ---- Backend resolution ------------------------------------------- #
+        _fuse_backend = _fuse_args.backend or os.environ.get("GRAPHIFY_BACKEND")
+        if not _fuse_backend:
+            try:
+                from graphify.llm import detect_backend as _fuse_detect_backend
+                _fuse_backend = _fuse_detect_backend()
+            except Exception:
+                _fuse_backend = None
+        if not _fuse_backend:
+            print(
+                "[graphify fuse] error: no LLM backend configured. "
+                "Set GRAPHIFY_BACKEND or an API key (GEMINI_API_KEY, MOONSHOT_API_KEY, "
+                "ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY) or pass --backend.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Import call_llm
+        try:
+            from graphify.llm import _call_llm as _fuse_call_llm
+        except ImportError as _fuse_import_err:
+            print(
+                f"[graphify fuse] error: could not import _call_llm from graphify.llm: {_fuse_import_err}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # ---- LLM calls per batch ------------------------------------------ #
+        _fuse_all_clusters: list[dict] = []
+        _fuse_batch_count = len(_fuse_batches)
+
+        for _fuse_batch_idx, _fuse_batch in enumerate(_fuse_batches):
+            # Build node label lookup
+            _fuse_batch_set = set(_fuse_batch)
+            _fuse_batch_listing = "\n".join(
+                f"  - {_nid}: {_fuse_G.nodes[_nid].get('label', _nid)}"
+                for _nid in _fuse_batch
+                if _nid in _fuse_G.nodes
+            )
+            _fuse_prompt = (
+                "You are merging synonym entities in a knowledge graph. "
+                "Below is a batch of node labels with their IDs.\n"
+                "Identify clusters of nodes that refer to the SAME real-world entity "
+                "(synonyms, abbreviations, morphological variants, plural/singular, casing differences).\n\n"
+                "Examples:\n"
+                '- "NMT" and "Neural Machine Translation" → cluster\n'
+                '- "Auth Service" and "AuthService" and "authentication service" → cluster\n'
+                '- "labor" and "labors" → cluster (morphological variant)\n'
+                '- "New York City" and "NYC" → cluster\n\n'
+                "Do NOT cluster:\n"
+                '- Conceptually similar but distinct entities ("REST API" and "GraphQL API" are NOT synonyms)\n'
+                '- Subtypes of a category ("Python" and "JavaScript" both being "Language" doesn\'t make them synonyms)\n\n'
+                f"Nodes:\n{_fuse_batch_listing}\n\n"
+                "Output strict JSON only:\n"
+                "{\n"
+                '  "clusters": [\n'
+                '    {"canonical_id": "<one of the IDs to keep>", '
+                '"canonical_label": "<best label>", '
+                '"alias_ids": [<list of other IDs in cluster>]}\n'
+                "  ]\n"
+                "}\n"
+                'If no clusters found in this batch, output: {"clusters": []}'
+            )
+
+            try:
+                _fuse_raw_resp = _fuse_call_llm(
+                    _fuse_prompt,
+                    backend=_fuse_backend,
+                    max_tokens=4096,
+                )
+            except Exception as _fuse_llm_err:
+                print(
+                    f"[graphify fuse] warning: LLM call for batch {_fuse_batch_idx + 1}/{_fuse_batch_count} "
+                    f"failed: {_fuse_llm_err}; skipping batch.",
+                    file=sys.stderr,
+                )
+                continue
+
+            # Parse response — strip optional markdown fences
+            _fuse_resp_text = _fuse_raw_resp.strip()
+            if _fuse_resp_text.startswith("```"):
+                _fuse_resp_text = _fuse_resp_text.split("```", 2)[1]
+                if _fuse_resp_text.startswith("json"):
+                    _fuse_resp_text = _fuse_resp_text[4:]
+                _fuse_resp_text = _fuse_resp_text.rsplit("```", 1)[0]
+            try:
+                _fuse_parsed = json.loads(_fuse_resp_text.strip())
+            except json.JSONDecodeError as _fuse_json_err:
+                print(
+                    f"[graphify fuse] warning: JSON parse failure for batch "
+                    f"{_fuse_batch_idx + 1}/{_fuse_batch_count}: {_fuse_json_err}; skipping batch.",
+                    file=sys.stderr,
+                )
+                continue
+
+            # Validate clusters: drop any with IDs not in the batch (LLM hallucination)
+            for _fuse_cluster in _fuse_parsed.get("clusters", []):
+                _fuse_cid = _fuse_cluster.get("canonical_id")
+                _fuse_aliases = _fuse_cluster.get("alias_ids", [])
+                if _fuse_cid not in _fuse_batch_set:
+                    print(
+                        f"[graphify fuse] warning: canonical_id {_fuse_cid!r} not in batch; "
+                        "dropping cluster (LLM hallucination).",
+                        file=sys.stderr,
+                    )
+                    continue
+                _fuse_bad_aliases = [_a for _a in _fuse_aliases if _a not in _fuse_batch_set]
+                if _fuse_bad_aliases:
+                    print(
+                        f"[graphify fuse] warning: alias_ids {_fuse_bad_aliases!r} not in batch; "
+                        "dropping those aliases (LLM hallucination).",
+                        file=sys.stderr,
+                    )
+                    _fuse_aliases = [_a for _a in _fuse_aliases if _a in _fuse_batch_set]
+                _fuse_cluster["alias_ids"] = _fuse_aliases
+                _fuse_all_clusters.append(_fuse_cluster)
+
+        # ---- Dry-run: report and exit ------------------------------------- #
+        if _fuse_args.dry_run:
+            if _fuse_all_clusters:
+                print("[graphify fuse] dry-run: proposed clusters:", file=sys.stderr)
+                for _fuse_cl in _fuse_all_clusters:
+                    print(
+                        f"  canonical={_fuse_cl.get('canonical_id')!r} "
+                        f"label={_fuse_cl.get('canonical_label')!r} "
+                        f"aliases={_fuse_cl.get('alias_ids')!r}",
+                        file=sys.stderr,
+                    )
+            else:
+                print("[graphify fuse] dry-run: no clusters proposed.", file=sys.stderr)
+            sys.exit(0)
+
+        # ---- Build raw alias→canonical mapping ---------------------------- #
+        _fuse_raw_mapping: dict[str, str] = {}
+        for _fuse_cluster in _fuse_all_clusters:
+            _fuse_canonical = _fuse_cluster.get("canonical_id")
+            for _fuse_alias in _fuse_cluster.get("alias_ids", []):
+                if _fuse_alias == _fuse_canonical:
+                    continue
+                if _fuse_alias in _fuse_extracted_safe:
+                    continue  # never fuse EXTRACTED-safe nodes
+                _fuse_raw_mapping[_fuse_alias] = _fuse_canonical
+
+        # ---- Fixed-point resolution: a→b, b→c  →  a→c, b→c -------------- #
+        def _fuse_resolve(node: str, visited: set[str]) -> str:
+            if node in visited:
+                return node  # cycle break
+            visited.add(node)
+            if node in _fuse_raw_mapping:
+                return _fuse_resolve(_fuse_raw_mapping[node], visited)
+            return node
+
+        _fuse_final_mapping: dict[str, str] = {
+            _a: _fuse_resolve(_a, set()) for _a in _fuse_raw_mapping
+        }
+
+        # ---- Hyperedge rewrite BEFORE contraction ------------------------- #
+        _fuse_hyperedges = _fuse_G.graph.get("hyperedges", [])
+        for _fuse_he in _fuse_hyperedges:
+            _fuse_members = _fuse_he.get("nodes") or _fuse_he.get("members") or []
+            if isinstance(_fuse_members, list):
+                _fuse_new_members = [_fuse_final_mapping.get(_fm, _fm) for _fm in _fuse_members]
+                # Deduplicate while preserving order
+                _fuse_seen: set[str] = set()
+                _fuse_deduped: list[str] = []
+                for _fm in _fuse_new_members:
+                    if _fm not in _fuse_seen:
+                        _fuse_seen.add(_fm)
+                        _fuse_deduped.append(_fm)
+                if "nodes" in _fuse_he:
+                    _fuse_he["nodes"] = _fuse_deduped
+                if "members" in _fuse_he:
+                    _fuse_he["members"] = _fuse_deduped
+        _fuse_G.graph["hyperedges"] = _fuse_hyperedges
+
+        # ---- Apply contractions ------------------------------------------ #
+        _fuse_fusion_count = 0
+        for _fuse_alias, _fuse_canonical in _fuse_final_mapping.items():
+            if _fuse_alias not in _fuse_G or _fuse_canonical not in _fuse_G:
+                continue  # already merged in a prior contraction
+            try:
+                _fuse_G = _fuse_nx.contracted_nodes(
+                    _fuse_G, _fuse_canonical, _fuse_alias,
+                    self_loops=False, copy=False,
+                )
+                _fuse_fusion_count += 1
+            except Exception as _fuse_contract_err:
+                print(
+                    f"[graphify fuse] warning: contraction {_fuse_alias!r}→{_fuse_canonical!r} "
+                    f"failed: {_fuse_contract_err}",
+                    file=sys.stderr,
+                )
+                continue
+
+        # ---- Safety gate -------------------------------------------------- #
+        if _fuse_fusion_count > _fuse_args.max_fusions:
+            print(
+                f"[graphify fuse] safety gate: produced {_fuse_fusion_count} fusions "
+                f"(max-fusions={_fuse_args.max_fusions}). Aborting without write. "
+                f"Use --max-fusions=<higher> to override.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # ---- Serialize and save ------------------------------------------ #
+        # nx.contracted_nodes injects a "contraction" attribute into edge data
+        # containing {(u, v): edge_attrs} dicts with tuple keys — not JSON-serializable.
+        # Strip those contraction attrs from all edges before serializing.
+        for _fu, _fv, _fed in _fuse_G.edges(data=True):
+            _fed.pop("contraction", None)
+        # Also strip from node attrs (contracted_nodes may store contraction there too)
+        for _fn, _fna in _fuse_G.nodes(data=True):
+            _fna.pop("contraction", None)
+
+        try:
+            _fuse_out_data = _fuse_jg.node_link_data(_fuse_G, edges="links")
+        except TypeError:
+            _fuse_out_data = _fuse_jg.node_link_data(_fuse_G)
+        # Preserve hyperedges in graph-level metadata
+        _fuse_out_data.setdefault("graph", {})
+        if isinstance(_fuse_out_data.get("graph"), dict):
+            _fuse_out_data["graph"]["hyperedges"] = _fuse_G.graph.get("hyperedges", [])
+        _fuse_graph_path.write_text(
+            json.dumps(_fuse_out_data, ensure_ascii=False, indent=None),
+            encoding="utf-8",
+        )
+
+        # ---- Git commit (graph.json only) --------------------------------- #
+        try:
+            _fuse_sp.run(
+                ["git", "add", "graphify-out/graph.json"],
+                cwd=str(_fuse_root),
+                check=True,
+                capture_output=True,
+            )
+            _fuse_date_str = _fuse_time.strftime("%Y-%m-%d")
+            _fuse_sp.run(
+                [
+                    "git", "-c", "user.email=hermes-sleep@local",
+                    "-c", "user.name=Hermes Sleep",
+                    "commit", "-m", f"KGGen synonym fusion {_fuse_date_str}",
+                    "graphify-out/graph.json",
+                ],
+                cwd=str(_fuse_root),
+                check=True,
+                capture_output=True,
+            )
+        except _fuse_sp.CalledProcessError as _fuse_gce:
+            print(
+                f"[graphify fuse] warning: git commit failed: {_fuse_gce.stderr!r}",
+                file=sys.stderr,
+            )
+
+        # ---- Status output ------------------------------------------------ #
+        print(
+            f"[graphify fuse] applied {_fuse_fusion_count} fusions "
+            f"(across {_fuse_batch_count} batches, "
+            f"candidate pool={len(_fuse_candidates)}, "
+            f"EXTRACTED-safe={len(_fuse_extracted_safe)} skipped)"
+        )
+        sys.exit(0)
+
+    elif cmd == "dream":
+        # ------------------------------------------------------------------ #
+        # graphify dream [--threshold 0.7] [--max-triplets 20]               #
+        #                [--backend X] [--dry-run]                            #
+        #                [--force-split-mode-unsafe] [<root>]                 #
+        # Graphusion-style novel triplet inference between disconnected       #
+        # communities.  LLM proposes cross-community edges that do not        #
+        # currently exist; edges are filtered by confidence threshold,        #
+        # capped, safety-gated, then committed.                               #
+        # ------------------------------------------------------------------ #
+        import argparse as _argparse
+        import itertools as _dream_itertools
+        import subprocess as _dream_sp
+        import time as _dream_time
+        from networkx.readwrite import json_graph as _dream_jg
+        import networkx as _dream_nx
+
+        _dream_parser = _argparse.ArgumentParser(
+            prog="graphify dream",
+            description="Graphusion novel triplet inference between disconnected communities.",
+        )
+        _dream_parser.add_argument(
+            "--threshold", type=float, default=0.7,
+            help="Minimum LLM confidence for an edge to be accepted (default: 0.7)",
+        )
+        _dream_parser.add_argument(
+            "--max-triplets", type=int, default=20, dest="max_triplets",
+            help="Soft cap: keep only the first N edges (default: 20)",
+        )
+        _dream_parser.add_argument(
+            "--backend", type=str, default=None,
+            help="LLM backend (overrides GRAPHIFY_BACKEND env; default: auto-detect)",
+        )
+        _dream_parser.add_argument(
+            "--dry-run", action="store_true", dest="dry_run",
+            help="Report proposed edges to stderr without mutating the graph",
+        )
+        _dream_parser.add_argument(
+            "--force-split-mode-unsafe", action="store_true", dest="force_split_mode_unsafe",
+            help="Bypass split-mode refusal; operates only on legacy graph.json",
+        )
+        _dream_parser.add_argument(
+            "root", nargs="?", default=".",
+            help="Repo root (default: cwd)",
+        )
+        _dream_args = _dream_parser.parse_args(sys.argv[2:])
+        _dream_root = Path(_dream_args.root).resolve()
+
+        # ---- Split-mode detection (mirrors decay/fuse pattern) ------------ #
+        _dream_is_split = False
+        try:
+            from graphify.privacy import load_overlays as _dream_load_overlays
+            _dream_overlays = _dream_load_overlays(_dream_root)
+            if _dream_overlays.get("shared") or _dream_overlays.get("private"):
+                _dream_is_split = True
+        except Exception:
+            for _dream_sentinel_name in (".graphifyshared", ".graphifyprivate"):
+                _dream_check = _dream_root
+                for _ in range(20):
+                    if (_dream_check / _dream_sentinel_name).exists():
+                        _dream_is_split = True
+                        break
+                    _dream_parent = _dream_check.parent
+                    if _dream_parent == _dream_check:
+                        break
+                    _dream_check = _dream_parent
+                if _dream_is_split:
+                    break
+
+        if not _dream_is_split:
+            try:
+                from graphify.config import find_remote as _dream_find_remote
+                if _dream_find_remote(_dream_root) is not None:
+                    _dream_is_split = True
+            except Exception:
+                pass
+
+        if _dream_is_split and not _dream_args.force_split_mode_unsafe:
+            print(
+                "graphify dream: split mode (overlays or configured remote) is not yet fully supported by the sleep cycle.\n"
+                "Tracking: https://github.com/safishamsi/graphify/issues/TBD-split-mode-sleep\n"
+                "Workaround: --force-split-mode-unsafe applies dream to the legacy graph-out/graph.json only "
+                "(skipping graph-private.json / graph-shared.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _dream_is_split and _dream_args.force_split_mode_unsafe:
+            print(
+                "[graphify dream] --force-split-mode-unsafe: split-mode files "
+                "(graph-private.json, graph-shared.json) NOT processed; only legacy graph.json processed.",
+                file=sys.stderr,
+            )
+
+        # ---- Load graph --------------------------------------------------- #
+        _dream_graph_path = _dream_root / "graphify-out" / "graph.json"
+        if not _dream_graph_path.exists():
+            print(
+                f"graphify dream: {_dream_graph_path} does not exist. Run 'graphify extract' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _dream_raw = json.loads(_dream_graph_path.read_text(encoding="utf-8"))
+        if "links" not in _dream_raw and "edges" in _dream_raw:
+            _dream_raw = dict(_dream_raw, links=_dream_raw["edges"])
+        try:
+            _dream_G = _dream_jg.node_link_graph(_dream_raw, edges="links")
+        except TypeError:
+            _dream_G = _dream_jg.node_link_graph(_dream_raw)
+
+        # ---- Identify communities ----------------------------------------- #
+        # community is stored in node attrs: node.attrs["community"] (int)
+        _dream_communities: dict[int, set[str]] = {}
+        for _dream_nid, _dream_nattrs in _dream_G.nodes(data=True):
+            _dream_comm = _dream_nattrs.get("community")
+            if _dream_comm is not None:
+                try:
+                    _dream_comm_int = int(_dream_comm)
+                except (TypeError, ValueError):
+                    continue
+                _dream_communities.setdefault(_dream_comm_int, set()).add(str(_dream_nid))
+
+        # Filter out singleton communities (size < 3)
+        _dream_viable: list[tuple[int, set[str]]] = [
+            (_dream_cid, _dream_cset)
+            for _dream_cid, _dream_cset in _dream_communities.items()
+            if len(_dream_cset) >= 3
+        ]
+
+        if len(_dream_viable) < 2:
+            print(
+                "[graphify dream] not enough connected communities (need >=2 of size >=3); skipping."
+            )
+            sys.exit(0)
+
+        # TOP-N = 5 largest communities
+        _dream_viable.sort(key=lambda _x: len(_x[1]), reverse=True)
+        _dream_top = _dream_viable[:5]
+
+        # ---- Backend resolution ------------------------------------------- #
+        _dream_backend = _dream_args.backend or os.environ.get("GRAPHIFY_BACKEND")
+        if not _dream_backend:
+            try:
+                from graphify.llm import detect_backend as _dream_detect_backend
+                _dream_backend = _dream_detect_backend()
+            except Exception:
+                _dream_backend = None
+        if not _dream_backend:
+            print(
+                "[graphify dream] error: no LLM backend configured. "
+                "Set GRAPHIFY_BACKEND or an API key (GEMINI_API_KEY, MOONSHOT_API_KEY, "
+                "ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY) or pass --backend.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Import _call_llm
+        try:
+            from graphify.llm import _call_llm as _dream_call_llm
+        except ImportError as _dream_import_err:
+            print(
+                f"[graphify dream] error: could not import _call_llm from graphify.llm: {_dream_import_err}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # ---- Process each disconnected community pair --------------------- #
+        _dream_edges_added: list[tuple[str, str, dict]] = []  # (source, target, attrs)
+        _dream_pairs_processed = 0
+        _dream_raw_proposals = 0
+
+        for (_dream_cid_a, _dream_cset_a), (_dream_cid_b, _dream_cset_b) in _dream_itertools.combinations(
+            _dream_top, 2
+        ):
+            # Only consider pairs with ZERO edges between them (Graphusion premise)
+            _dream_pair_edge_count = sum(
+                1
+                for _du in _dream_cset_a
+                for _dv in _dream_cset_b
+                if _dream_G.has_edge(_du, _dv) or _dream_G.has_edge(_dv, _du)
+            )
+            if _dream_pair_edge_count > 0:
+                continue
+
+            # Sample representatives: up to 3 nodes with degree > 3
+            def _dream_sample_reps(cset: set[str], G) -> list[str]:
+                # Sort for deterministic sampling (set iteration order is undefined)
+                _sorted = sorted(cset)
+                _high = [_n for _n in _sorted if G.degree(_n) > 3]
+                if len(_high) >= 3:
+                    return _high[:3]
+                # Fallback: degree > 1
+                _med = [_n for _n in _sorted if G.degree(_n) > 1]
+                if len(_med) >= 2:
+                    return _med[:3]
+                return _sorted[:3]
+
+            _dream_reps_a = _dream_sample_reps(_dream_cset_a, _dream_G)
+            _dream_reps_b = _dream_sample_reps(_dream_cset_b, _dream_G)
+
+            if len(_dream_reps_a) < 1 or len(_dream_reps_b) < 1:
+                continue
+            if len(_dream_reps_a) + len(_dream_reps_b) < 2:
+                continue
+
+            # Build prompt lines for community A
+            _dream_a_lines = "\n".join(
+                f"- {_nid}: {_dream_G.nodes[_nid].get('label', _nid)}"
+                for _nid in _dream_reps_a
+                if _nid in _dream_G.nodes
+            )
+            # Build prompt lines for community B
+            _dream_b_lines = "\n".join(
+                f"- {_nid}: {_dream_G.nodes[_nid].get('label', _nid)}"
+                for _nid in _dream_reps_b
+                if _nid in _dream_G.nodes
+            )
+
+            _dream_prompt = (
+                "You are inferring novel knowledge-graph edges between two disconnected community groups.\n"
+                "The graph currently has ZERO direct edges between Community A and Community B.\n"
+                "\n"
+                "Community A representatives:\n"
+                f"{_dream_a_lines}\n"
+                "\n"
+                "Community B representatives:\n"
+                f"{_dream_b_lines}\n"
+                "\n"
+                "Question: Is there a meaningful (causal, functional, analogical, hierarchical, or compositional) relationship between these two communities?\n"
+                "\n"
+                "If YES, propose 1-3 specific new edges as JSON. Each edge MUST:\n"
+                "- Use IDs from the lists above (do NOT invent new IDs)\n"
+                '- Specify a relation verb (e.g. "calls", "extends", "depends_on", "analogous_to", "instance_of", "produces", "validates")\n'
+                "- Include a confidence in [0, 1] reflecting your certainty\n"
+                "\n"
+                "Output strict JSON only:\n"
+                "{\n"
+                '  "edges": [\n'
+                '    {"source": "<id>", "target": "<id>", "relation": "<verb>", "confidence": <0-1>}\n'
+                "  ]\n"
+                "}\n"
+                'If NO meaningful relationship exists, output: {"edges": []}'
+            )
+
+            # Call LLM
+            try:
+                _dream_raw_resp = _dream_call_llm(
+                    _dream_prompt,
+                    backend=_dream_backend,
+                    max_tokens=1024,
+                )
+            except Exception as _dream_llm_err:
+                print(
+                    f"[graphify dream] warning: LLM call for pair "
+                    f"(community {_dream_cid_a}, community {_dream_cid_b}) failed: {_dream_llm_err}; skipping pair.",
+                    file=sys.stderr,
+                )
+                continue
+
+            # Parse strict JSON; skip pair on failure
+            _dream_resp_text = _dream_raw_resp.strip()
+            if _dream_resp_text.startswith("```"):
+                _dream_resp_text = _dream_resp_text.split("```", 2)[1]
+                if _dream_resp_text.startswith("json"):
+                    _dream_resp_text = _dream_resp_text[4:]
+                _dream_resp_text = _dream_resp_text.rsplit("```", 1)[0]
+            try:
+                _dream_parsed = json.loads(_dream_resp_text.strip())
+            except json.JSONDecodeError as _dream_json_err:
+                print(
+                    f"[graphify dream] warning: JSON parse failure for pair "
+                    f"(community {_dream_cid_a}, community {_dream_cid_b}): {_dream_json_err}; skipping pair.",
+                    file=sys.stderr,
+                )
+                continue
+
+            # Valid IDs are those that appear in the prompt
+            _dream_valid_ids: set[str] = set(_dream_reps_a) | set(_dream_reps_b)
+
+            for _dream_edge in _dream_parsed.get("edges", []):
+                _dream_src = _dream_edge.get("source")
+                _dream_tgt = _dream_edge.get("target")
+                _dream_rel = _dream_edge.get("relation", "related_to")
+                _dream_conf_val = _dream_edge.get("confidence", 0.0)
+
+                # Drop hallucinated IDs
+                if _dream_src not in _dream_valid_ids or _dream_tgt not in _dream_valid_ids:
+                    print(
+                        f"[graphify dream] warning: dropping edge ({_dream_src!r} → {_dream_tgt!r}): "
+                        "one or both IDs not in prompt (LLM hallucination).",
+                        file=sys.stderr,
+                    )
+                    continue
+
+                _dream_raw_proposals += 1
+
+                # Filter by threshold
+                try:
+                    _dream_conf_float = float(_dream_conf_val)
+                except (TypeError, ValueError):
+                    _dream_conf_float = 0.0
+
+                if _dream_conf_float < _dream_args.threshold:
+                    continue
+
+                _dream_edges_added.append((
+                    _dream_src,
+                    _dream_tgt,
+                    {
+                        "relation": _dream_rel,
+                        "confidence": "INFERRED",
+                        "confidence_score": _dream_conf_float,
+                        "weight": 0.5,
+                        "origin": "rem_dream",
+                        "source_file": "dream_log.md",
+                        "last_used": _dream_time.time(),
+                        "uses": 0,
+                    },
+                ))
+
+            _dream_pairs_processed += 1
+
+        # ---- Dry-run: report and exit ------------------------------------- #
+        if _dream_args.dry_run:
+            if _dream_edges_added:
+                print("[graphify dream] dry-run: proposed edges:", file=sys.stderr)
+                for _ds, _dt, _da in _dream_edges_added:
+                    print(
+                        f"  {_ds!r} --[{_da['relation']}]--> {_dt!r}  "
+                        f"confidence_score={_da['confidence_score']:.3f}",
+                        file=sys.stderr,
+                    )
+            else:
+                print("[graphify dream] dry-run: no edges proposed above threshold.", file=sys.stderr)
+            sys.exit(0)
+
+        # ---- Apply edges to G (skip existing) ----------------------------- #
+        _dream_applied: list[tuple[str, str, dict]] = []
+        for _dream_s, _dream_t, _dream_eattrs in _dream_edges_added:
+            if _dream_G.has_edge(_dream_s, _dream_t):
+                continue
+            _dream_G.add_edge(_dream_s, _dream_t, **_dream_eattrs)
+            _dream_applied.append((_dream_s, _dream_t, _dream_eattrs))
+
+        # ---- --max-triplets soft cap (rollback excess) -------------------- #
+        _dream_total_applied = len(_dream_applied)
+        if _dream_total_applied > _dream_args.max_triplets:
+            _dream_excess = _dream_applied[_dream_args.max_triplets:]
+            for _dream_xs, _dream_xt, _ in _dream_excess:
+                if _dream_G.has_edge(_dream_xs, _dream_xt):
+                    _dream_G.remove_edge(_dream_xs, _dream_xt)
+            _dream_applied = _dream_applied[:_dream_args.max_triplets]
+            print(
+                f"[graphify dream] capped at {_dream_args.max_triplets} edges "
+                f"(LLM proposed {_dream_total_applied} above threshold).",
+                file=sys.stderr,
+            )
+
+        _dream_edges_added_count = len(_dream_applied)
+
+        # ---- Safety gate: hard ceiling of 50 edges per subagent run ------- #
+        if _dream_edges_added_count > 50:
+            # Abort WITHOUT saving — roll back all applied edges first
+            for _dream_xs, _dream_xt, _ in _dream_applied:
+                if _dream_G.has_edge(_dream_xs, _dream_xt):
+                    _dream_G.remove_edge(_dream_xs, _dream_xt)
+            print(
+                f"[graphify dream] safety gate: produced {_dream_edges_added_count} edges (> 50). "
+                "Aborting without write.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # ---- Serialize and save ------------------------------------------ #
+        # Strip any contraction attribute (defensive, mirrors fuse)
+        for _du, _dv, _ded in _dream_G.edges(data=True):
+            _ded.pop("contraction", None)
+        for _dn, _dna in _dream_G.nodes(data=True):
+            _dna.pop("contraction", None)
+
+        try:
+            _dream_out_data = _dream_jg.node_link_data(_dream_G, edges="links")
+        except TypeError:
+            _dream_out_data = _dream_jg.node_link_data(_dream_G)
+        # Preserve hyperedges in graph-level metadata
+        _dream_out_data.setdefault("graph", {})
+        if isinstance(_dream_out_data.get("graph"), dict):
+            _dream_out_data["graph"]["hyperedges"] = _dream_G.graph.get("hyperedges", [])
+        _dream_graph_path.write_text(
+            json.dumps(_dream_out_data, ensure_ascii=False, indent=None),
+            encoding="utf-8",
+        )
+
+        # ---- Git commit (graph.json only) --------------------------------- #
+        try:
+            _dream_sp.run(
+                ["git", "add", "graphify-out/graph.json"],
+                cwd=str(_dream_root),
+                check=True,
+                capture_output=True,
+            )
+            _dream_date_str = _dream_time.strftime("%Y-%m-%d")
+            _dream_sp.run(
+                [
+                    "git", "-c", "user.email=hermes-sleep@local",
+                    "-c", "user.name=Hermes Sleep",
+                    "commit", "-m", f"Graphusion dream inference {_dream_date_str}",
+                    "graphify-out/graph.json",
+                ],
+                cwd=str(_dream_root),
+                check=True,
+                capture_output=True,
+            )
+        except _dream_sp.CalledProcessError as _dream_gce:
+            print(
+                f"[graphify dream] warning: git commit failed: {_dream_gce.stderr!r}",
+                file=sys.stderr,
+            )
+
+        # ---- Increment commits-this-night counter (best effort) ----------- #
+        try:
+            _dream_counter_path = (
+                Path.home() / ".hermes" / "cron" / "output" / "sleep_4_rem" / "commits_this_night.txt"
+            )
+            _dream_counter_path.parent.mkdir(parents=True, exist_ok=True)
+            _dream_prev_count = 0
+            if _dream_counter_path.exists():
+                try:
+                    _dream_prev_count = int(_dream_counter_path.read_text(encoding="utf-8").strip())
+                except ValueError:
+                    _dream_prev_count = 0
+            _dream_counter_path.write_text(str(_dream_prev_count + 1) + "\n", encoding="utf-8")
+        except Exception as _dream_cnt_err:
+            print(
+                f"[graphify dream] warning: could not update commits counter: {_dream_cnt_err}",
+                file=sys.stderr,
+            )
+
+        # ---- Status output ------------------------------------------------ #
+        print(
+            f"[graphify dream] added {_dream_edges_added_count} novel edges across "
+            f"{_dream_pairs_processed} community pairs "
+            f"(raw proposals: {_dream_raw_proposals}, threshold: {_dream_args.threshold})"
+        )
+        sys.exit(0)
+
+    elif cmd == "hypothesize":
+        # ------------------------------------------------------------------ #
+        # graphify hypothesize [--max-hypotheses 5] [--report-path <path>]   #
+        #                      [--dry-run]                                    #
+        #                      [--force-split-mode-unsafe] [<root>]           #
+        # Read GRAPH_REPORT.md's "surprising connections" section, create     #
+        # Hypothesis nodes with grounded_in edges back to source nodes.       #
+        # ------------------------------------------------------------------ #
+        import argparse as _hyp_argparse
+        import re as _hyp_re
+        import subprocess as _hyp_sp
+        import time as _hyp_time
+        from networkx.readwrite import json_graph as _hyp_jg
+        import networkx as _hyp_nx
+
+        _hyp_parser = _hyp_argparse.ArgumentParser(
+            prog="graphify hypothesize",
+            description="Create Hypothesis nodes from GRAPH_REPORT.md surprising connections.",
+        )
+        _hyp_parser.add_argument(
+            "--max-hypotheses", type=int, default=5, dest="max_hypotheses",
+            help="Maximum number of hypothesis nodes to create (default: 5)",
+        )
+        _hyp_parser.add_argument(
+            "--report-path", type=str, default=None, dest="report_path",
+            help="Path to GRAPH_REPORT.md (default: <root>/graphify-out/GRAPH_REPORT.md)",
+        )
+        _hyp_parser.add_argument(
+            "--dry-run", action="store_true", dest="dry_run",
+            help="Report proposed hypotheses to stderr without mutating the graph",
+        )
+        _hyp_parser.add_argument(
+            "--force-split-mode-unsafe", action="store_true", dest="force_split_mode_unsafe",
+            help="Bypass split-mode refusal; operates only on legacy graph.json",
+        )
+        _hyp_parser.add_argument(
+            "root", nargs="?", default=".",
+            help="Repo root (default: cwd)",
+        )
+        _hyp_args = _hyp_parser.parse_args(sys.argv[2:])
+        _hyp_root = Path(_hyp_args.root).resolve()
+
+        # ---- Split-mode detection (mirrors decay/fuse/dream pattern) ------- #
+        _hyp_is_split = False
+        try:
+            from graphify.privacy import load_overlays as _hyp_load_overlays
+            _hyp_overlays = _hyp_load_overlays(_hyp_root)
+            if _hyp_overlays.get("shared") or _hyp_overlays.get("private"):
+                _hyp_is_split = True
+        except Exception:
+            pass
+        # Always walk for sentinel files (load_overlays may not detect file-based sentinels)
+        if not _hyp_is_split:
+            for _hyp_sentinel_name in (".graphifyshared", ".graphifyprivate"):
+                _hyp_check = _hyp_root
+                for _ in range(20):
+                    if (_hyp_check / _hyp_sentinel_name).exists():
+                        _hyp_is_split = True
+                        break
+                    _hyp_parent = _hyp_check.parent
+                    if _hyp_parent == _hyp_check:
+                        break
+                    _hyp_check = _hyp_parent
+                if _hyp_is_split:
+                    break
+
+        if not _hyp_is_split:
+            try:
+                from graphify.config import find_remote as _hyp_find_remote
+                if _hyp_find_remote(_hyp_root) is not None:
+                    _hyp_is_split = True
+            except Exception:
+                pass
+
+        if _hyp_is_split and not _hyp_args.force_split_mode_unsafe:
+            print(
+                "graphify hypothesize: split mode (overlays or configured remote) is not yet fully supported by the sleep cycle.\n"
+                "Tracking: https://github.com/safishamsi/graphify/issues/TBD-split-mode-sleep\n"
+                "Workaround: --force-split-mode-unsafe applies hypothesize to the legacy graph-out/graph.json only "
+                "(skipping graph-private.json / graph-shared.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _hyp_is_split and _hyp_args.force_split_mode_unsafe:
+            print(
+                "[graphify hypothesize] --force-split-mode-unsafe: split-mode files "
+                "(graph-private.json, graph-shared.json) NOT processed; only legacy graph.json processed.",
+                file=sys.stderr,
+            )
+
+        # ---- Load graph --------------------------------------------------- #
+        _hyp_graph_path = _hyp_root / "graphify-out" / "graph.json"
+        if not _hyp_graph_path.exists():
+            print(
+                f"graphify hypothesize: {_hyp_graph_path} does not exist. Run 'graphify extract' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _hyp_raw = json.loads(_hyp_graph_path.read_text(encoding="utf-8"))
+        if "links" not in _hyp_raw and "edges" in _hyp_raw:
+            _hyp_raw = dict(_hyp_raw, links=_hyp_raw["edges"])
+        try:
+            _hyp_G = _hyp_jg.node_link_graph(_hyp_raw, edges="links")
+        except TypeError:
+            _hyp_G = _hyp_jg.node_link_graph(_hyp_raw)
+        # Hypothesis grounded_in edges are directional (Hypothesis → Source).
+        # Convert to DiGraph so add_edge ordering is preserved through serialization.
+        if not _hyp_G.is_directed():
+            _hyp_G = _hyp_nx.DiGraph(_hyp_G)
+
+        # ---- Locate GRAPH_REPORT.md --------------------------------------- #
+        if _hyp_args.report_path is not None:
+            _hyp_report_path = Path(_hyp_args.report_path).resolve()
+        else:
+            _hyp_report_path = _hyp_root / "graphify-out" / "GRAPH_REPORT.md"
+
+        # ---- Parse or fallback ------------------------------------------- #
+        _hyp_candidates: list[dict] = []
+
+        def _hyp_surprising_fallback() -> list[dict]:
+            """Call surprising_connections directly on the loaded graph."""
+            try:
+                from graphify.analyze import surprising_connections as _hyp_sc_fn
+            except ImportError:
+                return []
+            _hyp_fb_communities: dict[int, list[str]] = {}
+            for _hyp_fn, _hyp_fa in _hyp_G.nodes(data=True):
+                _hyp_fc = _hyp_fa.get("community")
+                if _hyp_fc is not None:
+                    try:
+                        _hyp_fc_int = int(_hyp_fc)
+                    except (TypeError, ValueError):
+                        continue
+                    _hyp_fb_communities.setdefault(_hyp_fc_int, []).append(str(_hyp_fn))
+            try:
+                _hyp_sc_results = _hyp_sc_fn(_hyp_G, _hyp_fb_communities, top_n=20)
+            except Exception:
+                return []
+            _hyp_fb_cands: list[dict] = []
+            for _hyp_sc_item in _hyp_sc_results:
+                # surprising_connections returns dicts with keys:
+                # source (label), target (label), source_files, confidence,
+                # relation, why/note
+                _hyp_sc_src_label = _hyp_sc_item.get("source", "")
+                _hyp_sc_tgt_label = _hyp_sc_item.get("target", "")
+                # Skip hypothesis nodes themselves (origin="hypothesis") —
+                # they should not seed new hypotheses on subsequent runs.
+                if _hyp_sc_src_label.startswith("H: ") or _hyp_sc_tgt_label.startswith("H: "):
+                    continue
+                if not _hyp_sc_src_label or not _hyp_sc_tgt_label:
+                    continue
+                # Resolve node IDs by matching label
+                _hyp_sc_src_id = None
+                _hyp_sc_tgt_id = None
+                for _hyp_nid, _hyp_nattrs in _hyp_G.nodes(data=True):
+                    if _hyp_nattrs.get("label") == _hyp_sc_src_label and _hyp_sc_src_id is None:
+                        _hyp_sc_src_id = str(_hyp_nid)
+                    if _hyp_nattrs.get("label") == _hyp_sc_tgt_label and _hyp_sc_tgt_id is None:
+                        _hyp_sc_tgt_id = str(_hyp_nid)
+                    if _hyp_sc_src_id and _hyp_sc_tgt_id:
+                        break
+                if not _hyp_sc_src_id:
+                    _hyp_sc_src_id = _hyp_sc_src_label
+                if not _hyp_sc_tgt_id:
+                    _hyp_sc_tgt_id = _hyp_sc_tgt_label
+                _hyp_sc_reason = (
+                    _hyp_sc_item.get("why")
+                    or _hyp_sc_item.get("note")
+                    or f"{_hyp_sc_item.get('confidence', '')} {_hyp_sc_item.get('relation', '')}".strip()
+                    or "(none recorded)"
+                )
+                _hyp_fb_cands.append({
+                    "source_id": _hyp_sc_src_id,
+                    "target_id": _hyp_sc_tgt_id,
+                    "source_label": _hyp_sc_src_label,
+                    "target_label": _hyp_sc_tgt_label,
+                    "reason": _hyp_sc_reason,
+                })
+            return _hyp_fb_cands
+
+        if not _hyp_report_path.exists():
+            print(
+                "[graphify hypothesize] GRAPH_REPORT.md not found. "
+                "Run 'graphify extract . --cluster-only --no-viz' first to generate it."
+            )
+            sys.exit(0)
+
+        # Try to parse the "Surprising Connections" section from the report.
+        # Use a line-by-line approach: find the header line, collect lines until
+        # the next header (or EOF). This is robust against DOTALL/\n+ regex pitfalls.
+        _hyp_report_text = _hyp_report_path.read_text(encoding="utf-8")
+        _hyp_report_lines = _hyp_report_text.splitlines()
+        _hyp_section_lines: list[str] = []
+        _hyp_in_surprising = False
+        _hyp_header_re = _hyp_re.compile(r"^#{1,6}\s+", _hyp_re.IGNORECASE)
+        for _hyp_rl in _hyp_report_lines:
+            if _hyp_header_re.match(_hyp_rl):
+                if _hyp_re.search(r"surprising", _hyp_rl, _hyp_re.IGNORECASE):
+                    _hyp_in_surprising = True
+                    continue
+                elif _hyp_in_surprising:
+                    break  # next section — stop collecting
+            if _hyp_in_surprising:
+                _hyp_section_lines.append(_hyp_rl)
+        _hyp_section_body = "\n".join(_hyp_section_lines)
+
+        _hyp_parsed_ok = False
+        if _hyp_section_body.strip():
+            _hyp_section_body = _hyp_section_body
+            # Each bullet/item: "- LabelA ↔ LabelB (via reason)" or similar
+            # Patterns: "- A ↔ B (via ...)", "- A <-> B ...", "- A — B ..."
+            _hyp_bullet_re = _hyp_re.compile(
+                r"[-*\d.]+\s+"                        # bullet or numbered list marker
+                r"(.+?)\s*(?:↔|<->|—|–|-+>)\s*"      # source label + separator
+                r"(.+?)"                               # target label
+                r"(?:\s*\((?:via\s+)?(.*?)\))?"        # optional (via reason)
+                r"\s*$",
+                _hyp_re.MULTILINE,
+            )
+            for _hyp_bm in _hyp_bullet_re.finditer(_hyp_section_body):
+                _hyp_src_lbl = _hyp_bm.group(1).strip()
+                _hyp_tgt_lbl = _hyp_bm.group(2).strip()
+                _hyp_reason = (_hyp_bm.group(3) or "").strip() or "(none recorded)"
+                if not _hyp_src_lbl or not _hyp_tgt_lbl:
+                    continue
+                # Resolve node IDs from graph by label match
+                _hyp_src_id: str | None = None
+                _hyp_tgt_id: str | None = None
+                for _hyp_nid, _hyp_nattrs in _hyp_G.nodes(data=True):
+                    if _hyp_nattrs.get("label") == _hyp_src_lbl and _hyp_src_id is None:
+                        _hyp_src_id = str(_hyp_nid)
+                    if _hyp_nattrs.get("label") == _hyp_tgt_lbl and _hyp_tgt_id is None:
+                        _hyp_tgt_id = str(_hyp_nid)
+                    if _hyp_src_id and _hyp_tgt_id:
+                        break
+                # Fall back to using label as ID if no node match
+                if not _hyp_src_id:
+                    _hyp_src_id = _hyp_src_lbl
+                if not _hyp_tgt_id:
+                    _hyp_tgt_id = _hyp_tgt_lbl
+                _hyp_candidates.append({
+                    "source_id": _hyp_src_id,
+                    "target_id": _hyp_tgt_id,
+                    "source_label": _hyp_src_lbl,
+                    "target_label": _hyp_tgt_lbl,
+                    "reason": _hyp_reason,
+                })
+                _hyp_parsed_ok = True
+
+        if not _hyp_parsed_ok:
+            # Fallback: call surprising_connections directly on the graph
+            _hyp_candidates = _hyp_surprising_fallback()
+
+        # ---- Top-N selection --------------------------------------------- #
+        # Deduplicate by (source_id, target_id) pair
+        _hyp_seen_pairs: set[tuple] = set()
+        _hyp_deduped: list[dict] = []
+        for _hyp_cand in _hyp_candidates:
+            _hyp_pair = (_hyp_cand["source_id"], _hyp_cand["target_id"])
+            _hyp_pair_rev = (_hyp_cand["target_id"], _hyp_cand["source_id"])
+            if _hyp_pair not in _hyp_seen_pairs and _hyp_pair_rev not in _hyp_seen_pairs:
+                _hyp_seen_pairs.add(_hyp_pair)
+                _hyp_deduped.append(_hyp_cand)
+        _hyp_candidates = _hyp_deduped[: _hyp_args.max_hypotheses]
+
+        # ---- Dry-run: report and exit ------------------------------------- #
+        if _hyp_args.dry_run:
+            if _hyp_candidates:
+                print("[graphify hypothesize] dry-run: proposed hypotheses:", file=sys.stderr)
+                for _hyp_dc in _hyp_candidates:
+                    print(
+                        f"  H: {_hyp_dc['source_label']} ↔ {_hyp_dc['target_label']}"
+                        f"  reason={_hyp_dc.get('reason', '(none recorded)')}",
+                        file=sys.stderr,
+                    )
+            else:
+                print(
+                    "[graphify hypothesize] dry-run: no surprising connections found.",
+                    file=sys.stderr,
+                )
+            sys.exit(0)
+
+        # ---- Generate Hypothesis nodes ------------------------------------ #
+        _hyp_now = _hyp_time.time()
+        _hyp_date_str = _hyp_time.strftime("%Y-%m-%d")
+        _hyp_brain_root = Path.home() / ".brain"
+        _hyp_dream_log_path = _hyp_brain_root / "raw" / "dreams" / f"{_hyp_date_str}.md"
+        _hyp_dream_log_path.parent.mkdir(parents=True, exist_ok=True)
+        _hyp_dream_log_lines: list[str] = [f"# Hypothesis log {_hyp_date_str}\n\n"]
+
+        _hyp_hypothesis_count = 0
+        for _hyp_c in _hyp_candidates:
+            _hyp_id = f"hypothesis:{_hyp_c['source_id']}::{_hyp_c['target_id']}"
+            _hyp_label = f"H: {_hyp_c['source_label']} ↔ {_hyp_c['target_label']}"
+
+            if _hyp_G.has_node(_hyp_id):
+                continue  # idempotent: skip if already created
+
+            _hyp_G.add_node(
+                _hyp_id,
+                label=_hyp_label,
+                source_file="dream_log.md",
+                origin="hypothesis",
+                weight=0.4,
+                created_at=_hyp_now,
+                max_observed_degree=0,
+            )
+            _hyp_G.add_edge(
+                _hyp_id, _hyp_c["source_id"],
+                relation="grounded_in",
+                confidence="INFERRED",
+                confidence_score=0.5,
+                weight=0.4,
+                origin="hypothesis",
+                source_file="dream_log.md",
+                last_used=_hyp_now,
+                uses=0,
+            )
+            _hyp_G.add_edge(
+                _hyp_id, _hyp_c["target_id"],
+                relation="grounded_in",
+                confidence="INFERRED",
+                confidence_score=0.5,
+                weight=0.4,
+                origin="hypothesis",
+                source_file="dream_log.md",
+                last_used=_hyp_now,
+                uses=0,
+            )
+
+            _hyp_dream_log_lines.append(f"## {_hyp_label}\n\n")
+            _hyp_dream_log_lines.append(f"- Source: `{_hyp_c['source_id']}` ({_hyp_c['source_label']})\n")
+            _hyp_dream_log_lines.append(f"- Target: `{_hyp_c['target_id']}` ({_hyp_c['target_label']})\n")
+            _hyp_dream_log_lines.append(f"- Reason: {_hyp_c.get('reason', '(none recorded)')}\n\n")
+
+            _hyp_hypothesis_count += 1
+
+        # ---- Safety gate: hard ceiling of 50 net-new entities ------------ #
+        if _hyp_hypothesis_count > 50:
+            print(
+                f"[graphify hypothesize] safety gate: produced {_hyp_hypothesis_count} nodes (> 50). "
+                "Aborting without write.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+        # ---- Write dream log --------------------------------------------- #
+        _hyp_dream_log_path.write_text("".join(_hyp_dream_log_lines), encoding="utf-8")
+
+        # ---- Serialize and save graph ------------------------------------ #
+        # Strip any contraction attribute (defensive, mirrors fuse/dream)
+        for _hyp_eu, _hyp_ev, _hyp_eed in _hyp_G.edges(data=True):
+            _hyp_eed.pop("contraction", None)
+        for _hyp_en, _hyp_ena in _hyp_G.nodes(data=True):
+            _hyp_ena.pop("contraction", None)
+
+        try:
+            _hyp_out_data = _hyp_jg.node_link_data(_hyp_G, edges="links")
+        except TypeError:
+            _hyp_out_data = _hyp_jg.node_link_data(_hyp_G)
+        # Preserve hyperedges in graph-level metadata
+        _hyp_out_data.setdefault("graph", {})
+        if isinstance(_hyp_out_data.get("graph"), dict):
+            _hyp_out_data["graph"]["hyperedges"] = _hyp_G.graph.get("hyperedges", [])
+        _hyp_graph_path.write_text(
+            json.dumps(_hyp_out_data, ensure_ascii=False, indent=None),
+            encoding="utf-8",
+        )
+
+        # ---- Git commit (graph.json only) -------------------------------- #
+        try:
+            _hyp_sp.run(
+                ["git", "add", "graphify-out/graph.json"],
+                cwd=str(_hyp_root),
+                check=True,
+                capture_output=True,
+            )
+            _hyp_sp.run(
+                [
+                    "git", "-c", "user.email=hermes-sleep@local",
+                    "-c", "user.name=Hermes Sleep",
+                    "commit", "-m", f"Hypothesis nodes {_hyp_date_str}",
+                    "graphify-out/graph.json",
+                ],
+                cwd=str(_hyp_root),
+                check=True,
+                capture_output=True,
+            )
+        except _hyp_sp.CalledProcessError as _hyp_gce:
+            print(
+                f"[graphify hypothesize] warning: git commit failed: {_hyp_gce.stderr!r}",
+                file=sys.stderr,
+            )
+
+        # ---- Increment commits-this-night counter (best effort) ---------- #
+        try:
+            _hyp_counter_path = (
+                Path.home() / ".hermes" / "cron" / "output" / "sleep_4_rem" / "commits_this_night.txt"
+            )
+            _hyp_counter_path.parent.mkdir(parents=True, exist_ok=True)
+            _hyp_prev_count = 0
+            if _hyp_counter_path.exists():
+                try:
+                    _hyp_prev_count = int(_hyp_counter_path.read_text(encoding="utf-8").strip())
+                except ValueError:
+                    _hyp_prev_count = 0
+            _hyp_counter_path.write_text(str(_hyp_prev_count + 1) + "\n", encoding="utf-8")
+        except Exception as _hyp_cnt_err:
+            print(
+                f"[graphify hypothesize] warning: could not update commits counter: {_hyp_cnt_err}",
+                file=sys.stderr,
+            )
+
+        # ---- Status output ----------------------------------------------- #
+        print(
+            f"[graphify hypothesize] created {_hyp_hypothesis_count} hypothesis nodes "
+            f"(max-hypotheses={_hyp_args.max_hypotheses}); "
+            f"dream log at {_hyp_dream_log_path}"
+        )
         sys.exit(0)
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
