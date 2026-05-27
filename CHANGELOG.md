@@ -2,6 +2,35 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.10.1 (2026-05-27)
+
+Stage 3.1: Hermes plugin (auto-detect + auto-cron + hippocampal drain). 0.10.1 closes the auto-integration gap that 0.10.0 left open: instead of pasting a snippet in Hermes chat, the user runs `graphify sleep install` and the plugin auto-registers all 6 cron jobs on the next Hermes session start. The plugin also implements the hippocampus → neocortex consolidation flow: aged Cortex entries (>7 days) in MEMORY.md are archived to graphify before being removed, turning the previously-destructive Wake cleanup into a knowledge-preserving transfer.
+
+Mental model (the "why two systems"):
+
+- **MEMORY.md = hippocampus** — bounded (2200 chars hardcoded), fast-access, frozen per session, episodic
+- **graphify = neocortex** — unbounded, persistent, structured, queryable
+
+The plugin handles the transfer automatically, mirroring the mammalian sleep-onset consolidation pattern (Lin/Snell sleep-time compute + Tononi homeostasis + McClelland CLS).
+
+New deliverables:
+
+- Feat: standalone Hermes plugin at `graphify/hermes-plugin/` (7 files: `__init__.py`, `provider.py`, `auto_register.py`, `drain.py`, `version.py`, `plugin.yaml`, `README.md`). Distributed via PyPI as part of `tecnoandina-graphify`; copied by `graphify sleep install` to `~/.hermes/plugins/memory/graphify/` (mirrors the existing skill-bundle copy mechanism with version-aware clean copy).
+- Feat: `GraphifyMemoryProvider(MemoryProvider)` plugin class implementing the Hermes plugin lifecycle. `is_available()` returns True iff sleep-cycle bundle + `graphify` CLI present + version >= 0.10.0. `on_session_start` calls `_auto_register_crons(manifest)` idempotently — registers all 6 cron jobs in Hermes' state.db via `cron.jobs.create_job()` (recon-confirmed Python-callable, no chat-paste needed). `on_memory_write` hook detects `memory(add)` writes; if MEMORY.md usage > 85%, spawns a detached pressure-drain subprocess (rate-limited to 1/min via sentinel file).
+- Feat: new `graphify sleep_0_drain` cron job (01:45 UTC, 15 min before Phase 1 Replay). Invokes `python -m graphify_plugin.drain --mode nightly --brain-root <root>`. Drains all Cortex entries with header `Cortex YYYY-MM-DD HH:MM` older than 7 days; archives each as a graphify node via `graphify add <tmpfile> --contributor hermes_hippocampal_drain` BEFORE removing from MEMORY.md. Conservative: user-curated entries (no Cortex header) NEVER touched.
+- Feat: 6th job in `_SLEEP_DEFAULT_JOBS` (Phase 0 drain). Total nightly budget rebalanced to $8.55 = $0.05 (drain) + $0.10 + $3.00 + $0.20 + $5.00 + $0.20. Job indexing in `--phases` flag now 0-based (Phase 0 = drain, Phase 1 = replay, ...).
+- Feat: `_sleep_install` extended to copy plugin to `~/.hermes/plugins/memory/graphify/` after copying the bundle. Print message: `[graphify sleep install] plugin installed to ~/.hermes/plugins/memory/graphify/ (version 0.10.1); restart Hermes to activate auto-cron-registration — NO manual paste needed.`
+- Tests: +13 new in `tests/test_hermes_plugin_*.py` (auto_register × 4, drain × 6, memory_pressure × 3). Mock `cron.jobs.create_job`, `subprocess.run`, `subprocess.Popen`. Test fixtures use `monkeypatch.setenv("HOME", tmp_path)` to isolate from real Hermes state. Existing `tests/test_sleep_install.py` updated: manifest job count 2 → 6 (default phases now include 0).
+- Packaging: `pyproject.toml [tool.setuptools.package-data]` extended with 7 hermes-plugin file paths. `MANIFEST.in` gains `graft graphify/hermes-plugin` line.
+- Architectural decision: per `CONTRIBUTING.md` of hermes-agent (verbatim *"We are no longer accepting new memory providers into this repo"*), the plugin lives in graphify's repo and is distributed via PyPI. **Zero changes to hermes-agent core.** The plugin uses only public Hermes APIs verified during the design recon: `cron.jobs.create_job`, `cron.jobs.load_jobs`, `MemoryProvider` ABC at `agent/memory_provider.py:42-150`, plugin hook system `on_session_start`/`on_session_end`/`on_memory_write`.
+
+Out of scope (deferred):
+
+- PR to hermes-agent core — user decision (D1 = plugin-only)
+- LLM-based classification of which MEMORY.md entries to archive (Option B in D3) — 0.10.1 ships the conservative `Cortex >7d only` policy; LLM curation is a future 0.11.0 enhancement
+- Drain of hand-curated user entries — explicit out-of-scope. The user owns their curated memory.
+- AGENTS.md auto-edit — plugin NEVER modifies user's AGENTS.md. README suggests an optional copy-paste block.
+
 ## 0.10.0 (2026-05-27)
 
 Stage 3 Sprint 4 + stable release. Phase 5 Wake — morning briefing into MEMORY.md — closes the 5-phase sleep cycle end-to-end. This is the first stable release of the cognitive consolidation infrastructure.

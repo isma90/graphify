@@ -4125,14 +4125,22 @@ def main() -> None:
                 )
                 sys.exit(1)
 
-        # Default job definitions (Sprint 1 = 2 jobs; Sprint 2 = 3 jobs)
+        # Default job definitions (0.10.1 = 6 jobs: Phase 0 drain + Phases 1-5 cycle)
         _SLEEP_DEFAULT_JOBS = [
+            {
+                "name": "sleep_0_drain",
+                "base_schedule": "45 1 * * *",
+                "template": "templates/sleep_0_drain.md",
+                "context_from": None,
+                "budget_ratio": 0.05 / 8.55,
+                "default_budget_usd": 0.05,
+            },
             {
                 "name": "sleep_1_replay",
                 "base_schedule": "0 2 * * *",
                 "template": "templates/sleep_1_replay.md",
-                "context_from": None,
-                "budget_ratio": 0.10 / 3.30,
+                "context_from": "sleep_0_drain",
+                "budget_ratio": 0.10 / 8.55,
                 "default_budget_usd": 0.10,
             },
             {
@@ -4140,7 +4148,7 @@ def main() -> None:
                 "base_schedule": "15 2 * * *",
                 "template": "templates/sleep_2_nrem.md",
                 "context_from": "sleep_1_replay",
-                "budget_ratio": 3.00 / 3.30,
+                "budget_ratio": 3.00 / 8.55,
                 "default_budget_usd": 3.00,
             },
             {
@@ -4148,7 +4156,7 @@ def main() -> None:
                 "base_schedule": "0 3 * * *",
                 "template": "templates/sleep_3_prune.md",
                 "context_from": "sleep_2_nrem",
-                "budget_ratio": 0.20 / 8.30,
+                "budget_ratio": 0.20 / 8.55,
                 "default_budget_usd": 0.20,
             },
             {
@@ -4156,7 +4164,7 @@ def main() -> None:
                 "base_schedule": "30 3 * * *",
                 "template": "templates/sleep_4_rem.md",
                 "context_from": "sleep_3_prune",
-                "budget_ratio": 5.00 / 8.50,
+                "budget_ratio": 5.00 / 8.55,
                 "default_budget_usd": 5.00,
             },
             {
@@ -4164,14 +4172,11 @@ def main() -> None:
                 "base_schedule": "30 4 * * *",
                 "template": "templates/sleep_5_wake.md",
                 "context_from": "sleep_4_rem",
-                "budget_ratio": 0.20 / 8.50,
+                "budget_ratio": 0.20 / 8.55,
                 "default_budget_usd": 0.20,
             },
         ]
-        # Sprint 4 ratios re-balanced for 5 jobs (total $8.50 = $0.10 + $3.00 + $0.20 + $5.00 + $0.20)
-        _SLEEP_DEFAULT_JOBS[0]["budget_ratio"] = 0.10 / 8.50
-        _SLEEP_DEFAULT_JOBS[1]["budget_ratio"] = 3.00 / 8.50
-        _SLEEP_DEFAULT_JOBS[2]["budget_ratio"] = 0.20 / 8.50
+        # 0.10.1: total $8.55 = $0.05 + $0.10 + $3.00 + $0.20 + $5.00 + $0.20
 
         def _sleep_build_jobs(
             phases: list[int],
@@ -4180,7 +4185,8 @@ def main() -> None:
         ) -> list[dict]:
             import re as _re
             # Filter jobs by requested phases (1-indexed)
-            phase_jobs = [j for i, j in enumerate(_SLEEP_DEFAULT_JOBS, 1) if i in phases]
+            # 0.10.1: enumerate from 0 so phase number == list index (Phase 0 = drain, Phase 1 = replay, ...)
+            phase_jobs = [j for i, j in enumerate(_SLEEP_DEFAULT_JOBS) if i in phases]
 
             # Parse schedule override: "X Y" → "X Y * * *"
             cron_overrides: list[str] = []
@@ -4315,11 +4321,27 @@ def main() -> None:
             _copy_ilr_tree(_src, _dest)
             _version_file.write_text(_new_version, encoding="utf-8")
 
-            # Determine phases
+            # ---- 0.10.1: also copy the Hermes plugin to ~/.hermes/plugins/memory/graphify/ ----
+            _plugin_src = _ilr.files("graphify") / "hermes-plugin"
+            _plugin_dest = Path.home() / ".hermes" / "plugins" / "memory" / "graphify"
+            _plugin_version_file = _plugin_dest / ".graphify_version"
+            _plugin_prev = _plugin_version_file.read_text().strip() if _plugin_version_file.exists() else None
+            if _plugin_prev != _new_version and _plugin_dest.exists():
+                shutil.rmtree(_plugin_dest)
+            _plugin_dest.mkdir(parents=True, exist_ok=True)
+            try:
+                _copy_ilr_tree(_plugin_src, _plugin_dest)
+                _plugin_version_file.write_text(_new_version, encoding="utf-8")
+                _plugin_copied = True
+            except (FileNotFoundError, OSError, ModuleNotFoundError):
+                # Plugin source absent (e.g., installed from older sdist without hermes-plugin/)
+                _plugin_copied = False
+
+            # Determine phases (0.10.1: default is all 6 phases including Phase 0 drain)
             if _args.phases:
                 _phases = [int(p.strip()) for p in _args.phases.split(",") if p.strip()]
             else:
-                _phases = [1, 2]
+                _phases = [0, 1, 2, 3, 4, 5]
 
             # Build jobs
             _jobs = _sleep_build_jobs(_phases, _args.schedule, _args.budget)
@@ -4365,6 +4387,12 @@ def main() -> None:
                 f"manifest at ~/.hermes/state/graphify-sleep.manifest.json "
                 f"({len(_jobs)} jobs)"
             )
+            if _plugin_copied:
+                print(
+                    f"[graphify sleep install] plugin installed to "
+                    f"~/.hermes/plugins/memory/graphify/ (version {_new_version}); "
+                    f"restart Hermes to activate auto-cron-registration — NO manual paste needed."
+                )
             sys.exit(0)
 
         # ------------------------------------------------------------------ #

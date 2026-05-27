@@ -1,0 +1,11 @@
+name: graphify
+version: 0.10.1
+description: "Graphify — long-term semantic memory (knowledge graph). Pairs with Hermes' MEMORY.md (hippocampus, 2200-char bounded) for cognitive consolidation. Auto-registers nightly sleep-cycle cron jobs and drains aged Cortex entries to graphify after 7 days, mirroring the mammalian hippocampus→neocortex transfer."
+pip_dependencies:
+  - "tecnoandina-graphify>=0.10.0"
+requires_env: []
+hooks:
+  - on_session_start
+  - on_session_end
+  - on_memory_write
+provider_class: graphify_plugin.provider.GraphifyMemoryProvider

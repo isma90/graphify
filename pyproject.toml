@@ -3,8 +3,8 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "graphifyy"
-version = "0.10.0"
+name = "tecnoandina-graphify"
+version = "0.10.1"
 description = "AI coding assistant skill (Claude Code, Codex, OpenCode, Cursor, Gemini CLI, Aider, OpenClaw, Factory Droid, Trae, Hermes, Kiro, Pi, Google Antigravity) - turn any folder of code, docs, papers, images, or videos into a queryable knowledge graph"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -97,7 +97,7 @@ packages = ["graphify"]
 include-package-data = false
 
 [tool.setuptools.package-data]
-graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-aider.md", "skill-copilot.md", "skill-claw.md", "skill-windows.md", "skill-droid.md", "skill-trae.md", "skill-kiro.md", "skill-vscode.md", "skill-pi.md", "sleep-cycle/SKILL.md", "sleep-cycle/README.md", "sleep-cycle/templates/*.md"]
+graphify = ["skill.md", "skill-codex.md", "skill-opencode.md", "skill-aider.md", "skill-copilot.md", "skill-claw.md", "skill-windows.md", "skill-droid.md", "skill-trae.md", "skill-kiro.md", "skill-vscode.md", "skill-pi.md", "sleep-cycle/SKILL.md", "sleep-cycle/README.md", "sleep-cycle/templates/*.md", "hermes-plugin/__init__.py", "hermes-plugin/provider.py", "hermes-plugin/auto_register.py", "hermes-plugin/drain.py", "hermes-plugin/version.py", "hermes-plugin/plugin.yaml", "hermes-plugin/README.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

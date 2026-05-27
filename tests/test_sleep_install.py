@@ -45,10 +45,12 @@ def test_install_writes_manifest_and_bundle(tmp_brain, tmp_path):
     manifest = tmp_path / ".hermes" / "state" / "graphify-sleep.manifest.json"
     assert manifest.is_file()
     data = json.loads(manifest.read_text())
-    assert len(data["jobs"]) == 2  # Sprint 1: 2 jobs
-    assert data["jobs"][0]["name"] == "sleep_1_replay"
-    assert data["jobs"][1]["name"] == "sleep_2_nrem"
-    assert data["jobs"][1]["context_from"] == "sleep_1_replay"
+    assert len(data["jobs"]) == 6  # 0.10.1: Phase 0 drain + Phases 1-5
+    assert data["jobs"][0]["name"] == "sleep_0_drain"
+    assert data["jobs"][1]["name"] == "sleep_1_replay"
+    assert data["jobs"][1]["context_from"] == "sleep_0_drain"
+    assert data["jobs"][2]["name"] == "sleep_2_nrem"
+    assert data["jobs"][2]["context_from"] == "sleep_1_replay"
     bundle = tmp_path / ".hermes" / "skills" / "sleep-cycle"
     assert bundle.is_dir()
     assert (bundle / "SKILL.md").is_file()
@@ -121,7 +123,7 @@ def test_status_reports_jobs(tmp_brain, tmp_path):
     assert r.returncode == 0, r.stderr
     data = json.loads(r.stdout)
     assert "jobs" in data
-    assert len(data["jobs"]) == 2
+    assert len(data["jobs"]) == 6  # 0.10.1: 6 jobs (Phase 0 + 1-5)
     # No actual runs yet — should report "not yet run"
     for job in data["jobs"]:
         assert job["last_run"] is None or job["status"] in ("not yet run", "ok", "failed")

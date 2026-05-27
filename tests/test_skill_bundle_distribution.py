@@ -87,7 +87,11 @@ def test_sdist_contains_bundle(tmp_path):
         check=False,
     )
     assert result.returncode == 0, f"build --sdist failed:\n{result.stderr}"
-    sdists = list(tmp_path.glob("graphifyy-*.tar.gz"))
+    # Package name is `tecnoandina-graphify` (renamed from upstream `graphifyy`)
+    sdists = list(tmp_path.glob("tecnoandina*graphify-*.tar.gz"))
+    if not sdists:
+        # Fallback to legacy name if rebuilding upstream
+        sdists = list(tmp_path.glob("graphifyy-*.tar.gz"))
     assert sdists, f"no sdist produced in {tmp_path}"
     sdist = sdists[0]
     with tarfile.open(sdist) as tf:
