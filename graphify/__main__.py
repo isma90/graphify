@@ -3972,6 +3972,664 @@ def main() -> None:
         else:
             print(f"[graphify] no merge driver installed at {_root_path}")
 
+    elif cmd == "touch":
+        # graphify touch <node-id> [<node-id> ...] [<root>]
+        # Sprint 1 stub: records touches to GRAPHIFY_TOUCH_LOG if set.
+        # The full serve.py hook lands in Sprint 2 (S2.A).
+        import argparse as _argparse
+        import time as _time
+        _parser = _argparse.ArgumentParser(prog="graphify touch")
+        _parser.add_argument("node_ids", nargs="+", help="One or more node IDs to touch")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _touch_log = os.environ.get("GRAPHIFY_TOUCH_LOG", "")
+        if not _touch_log:
+            print(
+                "[graphify touch] no GRAPHIFY_TOUCH_LOG env var set; this is a Sprint 1 stub. "
+                "Set the env var to enable touch logging.",
+                file=sys.stderr,
+            )
+            sys.exit(0)
+        _touch_path = Path(_touch_log)
+        _touch_path.parent.mkdir(parents=True, exist_ok=True)
+        with _touch_path.open(mode="a", encoding="utf-8") as _touch_fh:
+            for _nid in _args.node_ids:
+                _touch_fh.write(json.dumps({"id": _nid, "ts": _time.time()}) + "\n")
+        print(f"[graphify touch] recorded {len(_args.node_ids)} touches to {_touch_log}")
+        sys.exit(0)
+
+    elif cmd == "stats":
+        # graphify stats [--json] [<root>]
+        # Computes graph statistics from graphify-out/graph.json and prints them.
+        import argparse as _argparse
+        _parser = _argparse.ArgumentParser(prog="graphify stats")
+        _parser.add_argument("--json", action="store_true", dest="as_json",
+                             help="Output machine-readable JSON")
+        _parser.add_argument("root", nargs="?", default=".", help="Repo root (default: cwd)")
+        _args = _parser.parse_args(sys.argv[2:])
+        _stats_root = Path(_args.root).resolve()
+        _graph_path = _stats_root / "graphify-out" / "graph.json"
+        if not _graph_path.exists():
+            print(
+                f"[graphify stats] graph.json not found at {_graph_path}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        from networkx.readwrite import json_graph as _jg
+        import networkx as _nx
+        from graphify.detect import SCHEMA_VERSION as _SCHEMA_VERSION
+        _raw_stats = json.loads(_graph_path.read_text(encoding="utf-8"))
+        try:
+            _G_stats = _jg.node_link_graph(_raw_stats, edges="links")
+        except TypeError:
+            _G_stats = _jg.node_link_graph(_raw_stats)
+        _n_nodes = _G_stats.number_of_nodes()
+        _n_edges = _G_stats.number_of_edges()
+        # Communities: unique values of the 'community' node attribute
+        _comm_values = [d.get("community") for _, d in _G_stats.nodes(data=True) if d.get("community") is not None]
+        _n_communities = len(set(_comm_values))
+        # Confidence breakdown: ratios over edges
+        _conf_vals = [d.get("confidence", "EXTRACTED") for _, _, d in _G_stats.edges(data=True)]
+        _conf_total = len(_conf_vals) or 1
+        _confidence_breakdown: dict[str, float] = {}
+        for _cv in set(_conf_vals):
+            _confidence_breakdown[_cv] = _conf_vals.count(_cv) / _conf_total
+        # Origin breakdown: ratios over edges
+        _origin_vals = [d.get("origin") for _, _, d in _G_stats.edges(data=True) if d.get("origin") is not None]
+        _origin_total = len(_origin_vals) or 1
+        _origin_breakdown: dict[str, float] = {}
+        for _ov in set(_origin_vals):
+            _origin_breakdown[_ov] = _origin_vals.count(_ov) / _origin_total
+        # Avg degree
+        _avg_degree = (
+            sum(dict(_G_stats.degree()).values()) / _n_nodes if _n_nodes > 0 else 0.0
+        )
+        # Modularity Q — compute from community node attribute partitions
+        _modularity_q = _G_stats.graph.get("modularity_q_cached")
+        if _modularity_q is None:
+            try:
+                _comm_map: dict[int | str, set] = {}
+                for _nid, _nd in _G_stats.nodes(data=True):
+                    _c = _nd.get("community")
+                    if _c is None:
+                        raise ValueError("node missing community attr")
+                    _comm_map.setdefault(_c, set()).add(_nid)
+                _partition = list(_comm_map.values())
+                if len(_partition) > 0:
+                    _G_undirected = _G_stats.to_undirected(as_view=True) if _G_stats.is_directed() else _G_stats
+                    _modularity_q = _nx.algorithms.community.modularity(
+                        _G_undirected, _partition, resolution=1.0
+                    )
+                    _G_stats.graph["modularity_q_cached"] = _modularity_q
+                else:
+                    _modularity_q = None
+            except Exception:
+                _modularity_q = None
+        _stats_result: dict = {
+            "nodes": _n_nodes,
+            "edges": _n_edges,
+            "communities": _n_communities,
+            "confidence_breakdown": _confidence_breakdown,
+            "origin_breakdown": _origin_breakdown,
+            "modularity_q": _modularity_q,
+            "avg_degree": round(_avg_degree, 4),
+            "schema_version": _SCHEMA_VERSION,
+        }
+        if _args.as_json:
+            print(json.dumps(_stats_result, ensure_ascii=False))
+        else:
+            _col_w = 22
+            print(f"{'nodes':<{_col_w}}{_stats_result['nodes']}")
+            print(f"{'edges':<{_col_w}}{_stats_result['edges']}")
+            print(f"{'communities':<{_col_w}}{_stats_result['communities']}")
+            print(f"{'avg_degree':<{_col_w}}{_stats_result['avg_degree']}")
+            print(f"{'modularity_q':<{_col_w}}{_stats_result['modularity_q']}")
+            print(f"{'schema_version':<{_col_w}}{_stats_result['schema_version']}")
+            print(f"{'confidence_breakdown':<{_col_w}}{_stats_result['confidence_breakdown']}")
+            print(f"{'origin_breakdown':<{_col_w}}{_stats_result['origin_breakdown']}")
+        sys.exit(0)
+
+    elif cmd == "sleep":
+        # graphify sleep {install|status|uninstall|demo|pause|resume} ...
+        _sleep_sub = sys.argv[2] if len(sys.argv) > 2 else None
+
+        # ------------------------------------------------------------------ #
+        # Shared helpers                                                       #
+        # ------------------------------------------------------------------ #
+        def _sleep_manifest_path() -> Path:
+            return Path.home() / ".hermes" / "state" / "graphify-sleep.manifest.json"
+
+        def _sleep_bundle_dest() -> Path:
+            return Path.home() / ".hermes" / "skills" / "sleep-cycle"
+
+        def _sleep_validate_brain_root(raw: str) -> Path:
+            p = Path(raw).resolve()
+            if not str(p).startswith(str(Path.home())):
+                print(
+                    f"graphify sleep install: --brain-root must be under your home directory, "
+                    f"got: {p}. Path traversal risk.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            return p
+
+        def _sleep_check_git(brain_root: Path) -> None:
+            git_dir = brain_root / ".git"
+            if not git_dir.exists():
+                print(
+                    f"graphify sleep install: {brain_root} is not a git repository. "
+                    "Run 'git init' and commit your initial work, then run "
+                    "'graphify sleep install' again. The sleep cycle stores phase "
+                    "results as git commits.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+        # Default job definitions for Sprint 1
+        _SLEEP_DEFAULT_JOBS = [
+            {
+                "name": "sleep_1_replay",
+                "base_schedule": "0 2 * * *",
+                "template": "templates/sleep_1_replay.md",
+                "context_from": None,
+                "budget_ratio": 0.10 / 3.10,
+                "default_budget_usd": 0.10,
+            },
+            {
+                "name": "sleep_2_nrem",
+                "base_schedule": "15 2 * * *",
+                "template": "templates/sleep_2_nrem.md",
+                "context_from": "sleep_1_replay",
+                "budget_ratio": 3.00 / 3.10,
+                "default_budget_usd": 3.00,
+            },
+        ]
+
+        def _sleep_build_jobs(
+            phases: list[int],
+            schedule_override: str | None,
+            budget_total: float | None,
+        ) -> list[dict]:
+            import re as _re
+            # Filter jobs by requested phases (1-indexed)
+            phase_jobs = [j for i, j in enumerate(_SLEEP_DEFAULT_JOBS, 1) if i in phases]
+
+            # Parse schedule override: "X Y" → "X Y * * *"
+            cron_overrides: list[str] = []
+            if schedule_override:
+                parts = schedule_override.strip().split()
+                if len(parts) >= 2:
+                    base_min = int(parts[0])
+                    base_hour = int(parts[1])
+                    offsets_min = [0, 15, 45, 60, 60]
+                    for idx in range(len(phase_jobs)):
+                        total_offset = sum(offsets_min[:idx])
+                        m = (base_min + total_offset) % 60
+                        h = (base_hour + (base_min + total_offset) // 60) % 24
+                        cron_overrides.append(f"{m} {h} * * *")
+
+            result = []
+            total_ratio = sum(j["budget_ratio"] for j in phase_jobs) or 1.0
+            for idx, job in enumerate(phase_jobs):
+                sched = cron_overrides[idx] if idx < len(cron_overrides) else job["base_schedule"]
+                if budget_total is not None:
+                    per_job_budget = round(
+                        budget_total * (job["budget_ratio"] / total_ratio), 6
+                    )
+                else:
+                    per_job_budget = job["default_budget_usd"]
+                result.append({
+                    "name": job["name"],
+                    "schedule": sched,
+                    "skill": "sleep-cycle",
+                    "template": job["template"],
+                    "context_from": job["context_from"],
+                    "budget_usd": per_job_budget,
+                })
+            return result
+
+        def _sleep_snippet_lines(jobs: list[dict]) -> list[str]:
+            lines = []
+            for job in jobs:
+                lines.append(f'cronjob(action="delete", name="{job["name"]}")')
+            for job in jobs:
+                create_parts = [
+                    f'cronjob(action="create"',
+                    f'name="{job["name"]}"',
+                    f'schedule="{job["schedule"]}"',
+                    f'skill="{job["skill"]}"',
+                    f'template="{job["template"]}"',
+                ]
+                if job.get("context_from"):
+                    create_parts.append(f'context_from="{job["context_from"]}"')
+                lines.append(", ".join(create_parts) + ")")
+            return lines
+
+        def _sleep_print_snippet(jobs: list[dict]) -> None:
+            print()
+            print(
+                "  IMPORTANT: Paste the snippet below into your Hermes chat to register the cron jobs."
+            )
+            print(
+                "  Re-running this install: re-paste to update; the snippet includes "
+                "delete-then-create for safe replacement."
+            )
+            print()
+            print("--- BEGIN HERMES SNIPPET ---")
+            for line in _sleep_snippet_lines(jobs):
+                print(line)
+            print("--- END HERMES SNIPPET ---")
+            print()
+            print("To view this snippet again: graphify sleep install --show-snippet")
+
+        # ------------------------------------------------------------------ #
+        # install                                                              #
+        # ------------------------------------------------------------------ #
+        if _sleep_sub == "install":
+            import argparse as _argparse
+            import importlib.resources as _ilr
+            _parser = _argparse.ArgumentParser(prog="graphify sleep install")
+            _parser.add_argument("--brain-root", dest="brain_root", default=None)
+            _parser.add_argument("--schedule", default=None,
+                                 help='Cron offset, e.g. "0 2" for 2:00 AM')
+            _parser.add_argument("--budget", dest="budget", type=float, default=None,
+                                 help="Total budget in USD")
+            _parser.add_argument("--phases", default=None,
+                                 help="Comma-separated phase numbers to enable, e.g. '1,2'")
+            _parser.add_argument("--show-snippet", action="store_true", dest="show_snippet")
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            # --show-snippet: just print from existing manifest
+            if _args.show_snippet:
+                _mpath = _sleep_manifest_path()
+                if not _mpath.exists():
+                    print(
+                        "graphify sleep install: no manifest found. "
+                        "Run 'graphify sleep install' first.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+                _mdata = json.loads(_mpath.read_text(encoding="utf-8"))
+                _sleep_print_snippet(_mdata["jobs"])
+                sys.exit(0)
+
+            # Determine brain root
+            _brain_raw = _args.brain_root or _args.root
+            _brain_root = _sleep_validate_brain_root(_brain_raw)
+            _sleep_check_git(_brain_root)
+
+            # Locate bundle source
+            _src = _ilr.files("graphify") / "sleep-cycle"
+
+            # Locate dest
+            _dest = _sleep_bundle_dest()
+
+            # Version-aware clean copy
+            _version_file = _dest / ".graphify_version"
+            _new_version = __version__
+            _prev_version = _version_file.read_text().strip() if _version_file.exists() else None
+            if _prev_version != _new_version and _dest.exists():
+                shutil.rmtree(_dest)
+            _dest.mkdir(parents=True, exist_ok=True)
+            # Copy using importlib.resources traversal
+            def _copy_ilr_tree(src_pkg, dst: Path) -> None:
+                for _item in src_pkg.iterdir():
+                    _item_name = _item.name
+                    _item_dst = dst / _item_name
+                    try:
+                        # It's a directory if it has children
+                        list(_item.iterdir())
+                        _item_dst.mkdir(parents=True, exist_ok=True)
+                        _copy_ilr_tree(_item, _item_dst)
+                    except (NotADirectoryError, TypeError):
+                        _item_dst.write_bytes(_item.read_bytes())
+            _copy_ilr_tree(_src, _dest)
+            _version_file.write_text(_new_version, encoding="utf-8")
+
+            # Determine phases
+            if _args.phases:
+                _phases = [int(p.strip()) for p in _args.phases.split(",") if p.strip()]
+            else:
+                _phases = [1, 2]
+
+            # Build jobs
+            _jobs = _sleep_build_jobs(_phases, _args.schedule, _args.budget)
+            _budget_total = (
+                _args.budget if _args.budget is not None
+                else sum(j["budget_usd"] for j in _jobs)
+            )
+
+            # Write manifest
+            _manifest_path = _sleep_manifest_path()
+            _manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            _manifest_data = {
+                "version": _new_version,
+                "api_version": "hermes-0.13.0",
+                "brain_root": str(_brain_root),
+                "schedule_offset_minutes": 0,
+                "phases_enabled": _phases,
+                "budget_usd_total": round(_budget_total, 6),
+                "jobs": _jobs,
+            }
+            _manifest_path.write_text(
+                json.dumps(_manifest_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            # Print snippet
+            print(
+                f"\n  IMPORTANT: Paste the snippet below into your Hermes chat to register the cron jobs."
+            )
+            print(
+                "  Re-running this install: re-paste to update; the snippet includes "
+                "delete-then-create for safe replacement.\n"
+            )
+            print("--- BEGIN HERMES SNIPPET ---")
+            for _line in _sleep_snippet_lines(_jobs):
+                print(_line)
+            print("--- END HERMES SNIPPET ---\n")
+            print("To view this snippet again: graphify sleep install --show-snippet")
+
+            print(
+                f"\n[graphify sleep install] copied skill bundle to "
+                f"~/.hermes/skills/sleep-cycle/ (version {_new_version}); "
+                f"manifest at ~/.hermes/state/graphify-sleep.manifest.json "
+                f"({len(_jobs)} jobs)"
+            )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # status                                                               #
+        # ------------------------------------------------------------------ #
+        elif _sleep_sub == "status":
+            import argparse as _argparse
+            _parser = _argparse.ArgumentParser(prog="graphify sleep status")
+            _parser.add_argument("--json", action="store_true", dest="as_json")
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            _mpath = _sleep_manifest_path()
+            if not _mpath.exists():
+                print(
+                    "graphify sleep status: no manifest found. "
+                    "Run 'graphify sleep install' first.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            _mdata = json.loads(_mpath.read_text(encoding="utf-8"))
+            _cron_base = Path.home() / ".hermes" / "cron" / "output"
+
+            _status_jobs = []
+            for _job in _mdata["jobs"]:
+                _jname = _job["name"]
+                _jdir = _cron_base / _jname
+                _last_run = None
+                _status_str = "not yet run"
+                _details = ""
+                _actual_cost = None
+                if _jdir.exists():
+                    _run_files = sorted(
+                        _jdir.iterdir(),
+                        key=lambda f: f.stat().st_mtime,
+                        reverse=True,
+                    )
+                    if _run_files:
+                        _latest = _run_files[0]
+                        import datetime as _dt
+                        _last_run = _dt.datetime.utcfromtimestamp(
+                            _latest.stat().st_mtime
+                        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                        _content = _latest.read_text(encoding="utf-8", errors="replace")
+                        import re as _re2
+                        _ok_m = _re2.search(r"\[ok\]", _content)
+                        _fail_m = _re2.search(r"\[failed: ([^\]]+)\]", _content)
+                        _skip_m = _re2.search(r"\[skipped[^\]]*\]", _content)
+                        if _ok_m:
+                            _status_str = "ok"
+                        elif _fail_m:
+                            _status_str = f"failed: {_fail_m.group(1)}"
+                        elif _skip_m:
+                            _status_str = "skipped"
+                        # Extract details line (last non-empty line)
+                        _lines = [l.strip() for l in _content.splitlines() if l.strip()]
+                        _details = _lines[-1] if _lines else ""
+
+                _status_jobs.append({
+                    "name": _jname,
+                    "schedule": _job["schedule"],
+                    "last_run": _last_run,
+                    "status": _status_str,
+                    "details": _details,
+                    "budget_usd": _job["budget_usd"],
+                    "actual_cost_7d_avg": _actual_cost,
+                })
+
+            _status_result = {
+                "manifest_version": _mdata.get("version"),
+                "api_version": _mdata.get("api_version"),
+                "brain_root": _mdata.get("brain_root"),
+                "phases_enabled": _mdata.get("phases_enabled"),
+                "jobs": _status_jobs,
+            }
+
+            if _args.as_json:
+                print(json.dumps(_status_result, ensure_ascii=False))
+            else:
+                print(f"brain_root        {_status_result['brain_root']}")
+                print(f"manifest_version  {_status_result['manifest_version']}")
+                print(f"phases_enabled    {_status_result['phases_enabled']}")
+                print()
+                _col = 20
+                print(f"{'JOB':<{_col}} {'SCHEDULE':<15} {'LAST RUN':<22} STATUS")
+                print("-" * 80)
+                for _sj in _status_jobs:
+                    _budget_flag = ""
+                    if _sj["actual_cost_7d_avg"] and _sj["actual_cost_7d_avg"] > _sj["budget_usd"] * 1.2:
+                        _budget_flag = "  over budget"
+                    print(
+                        f"{_sj['name']:<{_col}} {_sj['schedule']:<15} "
+                        f"{(_sj['last_run'] or 'never'):<22} {_sj['status']}{_budget_flag}"
+                    )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # uninstall                                                            #
+        # ------------------------------------------------------------------ #
+        elif _sleep_sub == "uninstall":
+            import argparse as _argparse
+            import time as _time2
+            _parser = _argparse.ArgumentParser(prog="graphify sleep uninstall")
+            _parser.add_argument("--keep-state", action="store_true", dest="keep_state")
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            _dest = _sleep_bundle_dest()
+            if _dest.exists():
+                shutil.rmtree(_dest)
+
+            _mpath = _sleep_manifest_path()
+            _delete_lines: list[str] = []
+            if _mpath.exists():
+                try:
+                    _mu = json.loads(_mpath.read_text(encoding="utf-8"))
+                    _delete_lines = [
+                        f'cronjob(action="delete", name="{j["name"]}")'
+                        for j in _mu.get("jobs", [])
+                    ]
+                except Exception:
+                    pass
+                if not _args.keep_state:
+                    _ts = int(_time2.time())
+                    _archive = _mpath.parent / f"graphify-sleep.manifest.json.archive-{_ts}"
+                    _mpath.rename(_archive)
+
+            # Print unregister snippet
+            print()
+            print("Paste the following into your Hermes chat to unregister the cron jobs:")
+            print()
+            print("--- BEGIN HERMES SNIPPET ---")
+            for _dl in _delete_lines:
+                print(_dl)
+            print("--- END HERMES SNIPPET ---")
+            print()
+            print(
+                "[graphify sleep uninstall] removed skill bundle; manifest archived "
+                "(use --keep-state to keep active)."
+            )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # demo                                                                 #
+        # ------------------------------------------------------------------ #
+        elif _sleep_sub == "demo":
+            import argparse as _argparse
+            import subprocess as _sp
+            import time as _time3
+            _parser = _argparse.ArgumentParser(prog="graphify sleep demo")
+            _parser.add_argument("--brain-root", dest="brain_root", default=None)
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            _brain_raw = _args.brain_root or _args.root
+            _brain_root = _sleep_validate_brain_root(_brain_raw)
+
+            _t0 = _time3.monotonic()
+
+            _graph_path = _brain_root / "graphify-out" / "graph.json"
+            if not _graph_path.exists():
+                # Create fixture corpus
+                _fixture_dir = _brain_root / "demo-fixture"
+                _fixture_dir.mkdir(parents=True, exist_ok=True)
+                (_fixture_dir / "a.py").write_text(
+                    'def alpha():\n    """Alpha function."""\n    return 1\n',
+                    encoding="utf-8",
+                )
+                (_fixture_dir / "b.py").write_text(
+                    'def beta():\n    """Beta function."""\n    return 2\n',
+                    encoding="utf-8",
+                )
+                (_fixture_dir / "c.py").write_text(
+                    'def gamma():\n    """Gamma function."""\n    return 3\n',
+                    encoding="utf-8",
+                )
+                print(f"[demo] created fixture corpus at {_fixture_dir}")
+
+            # Phase 1: replay — simulate session search
+            print("[demo phase 1: replay]")
+            _notes_dir = _brain_root / "graphify-out"
+            _notes_dir.mkdir(parents=True, exist_ok=True)
+            _fixture_files = list((_brain_root / "demo-fixture").glob("*.py")) if (_brain_root / "demo-fixture").exists() else []
+            _raw_notes = []
+            for _ff in _fixture_files:
+                _raw_notes.append(f"# {_ff.name}\n{_ff.read_text(encoding='utf-8')}")
+            (_notes_dir / "demo_phase1_notes.txt").write_text(
+                "\n\n".join(_raw_notes), encoding="utf-8"
+            )
+            print(f"  processed {len(_fixture_files)} fixture files")
+
+            # Phase 2: extract
+            print("[demo phase 2: nrem extract]")
+            try:
+                _extract_result = _sp.run(
+                    [sys.executable, "-m", "graphify", "extract", str(_brain_root)],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                )
+            except _sp.TimeoutExpired:
+                print(
+                    "[graphify sleep demo] extract timed out after 120s. "
+                    "Try on a smaller corpus.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+            if _extract_result.returncode != 0:
+                print(f"  extract stderr: {_extract_result.stderr[:500]}", file=sys.stderr)
+
+            # Print stats if graph was produced
+            _elapsed = round(_time3.monotonic() - _t0, 1)
+            if _graph_path.exists():
+                try:
+                    from networkx.readwrite import json_graph as _jg_demo
+                    _raw_demo = json.loads(_graph_path.read_text(encoding="utf-8"))
+                    try:
+                        _G_demo = _jg_demo.node_link_graph(_raw_demo, edges="links")
+                    except TypeError:
+                        _G_demo = _jg_demo.node_link_graph(_raw_demo)
+                    print(
+                        f"  graph: {_G_demo.number_of_nodes()} nodes, "
+                        f"{_G_demo.number_of_edges()} edges"
+                    )
+                except Exception:
+                    pass
+
+            print(
+                f"\n[graphify sleep demo] completed in {_elapsed}s. "
+                "To run nightly automatically: graphify sleep install"
+            )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # pause                                                                #
+        # ------------------------------------------------------------------ #
+        elif _sleep_sub == "pause":
+            import argparse as _argparse
+            import datetime as _dt2
+            _parser = _argparse.ArgumentParser(prog="graphify sleep pause")
+            _parser.add_argument("--tonight", action="store_true", dest="tonight")
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            if not _args.tonight:
+                print(
+                    "Usage: graphify sleep pause --tonight [<root>]",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
+            _pause_root = Path(_args.root).resolve()
+            _tomorrow = _dt2.datetime.utcnow().date() + _dt2.timedelta(days=1)
+            _until_iso = f"{_tomorrow.isoformat()}T23:59:00Z"
+            _sentinel = _pause_root / ".graphify_sleep_paused"
+            _sentinel.write_text(f"paused_until={_until_iso}\n", encoding="utf-8")
+            print(
+                f"[graphify sleep pause] sentinel written to {_sentinel}; "
+                f"cycle paused until {_until_iso}."
+            )
+            sys.exit(0)
+
+        # ------------------------------------------------------------------ #
+        # resume                                                               #
+        # ------------------------------------------------------------------ #
+        elif _sleep_sub == "resume":
+            import argparse as _argparse
+            _parser = _argparse.ArgumentParser(prog="graphify sleep resume")
+            _parser.add_argument("root", nargs="?", default=".")
+            _args = _parser.parse_args(sys.argv[3:])
+
+            _resume_root = Path(_args.root).resolve()
+            _sentinel = _resume_root / ".graphify_sleep_paused"
+            if _sentinel.exists():
+                _sentinel.unlink()
+                print(
+                    "[graphify sleep resume] sentinel cleared; cycle will run normally tonight."
+                )
+            else:
+                print(
+                    "[graphify sleep resume] no sentinel found; cycle is already active."
+                )
+            sys.exit(0)
+
+        else:
+            print(
+                "Usage: graphify sleep {install|status|uninstall|demo|pause --tonight|resume} ...",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.
         # Common when following the PowerShell note in README (`graphify .`) or

@@ -6,6 +6,26 @@ VALID_CONFIDENCES = {"EXTRACTED", "INFERRED", "AMBIGUOUS"}
 REQUIRED_NODE_FIELDS = {"id", "label", "file_type", "source_file"}
 REQUIRED_EDGE_FIELDS = {"source", "target", "relation", "confidence", "source_file"}
 
+# Stage 3 — sleep-cycle field constants.
+# VALID_ORIGINS: extended from Stage 2 ("private"|"shared") to include cycle-produced origins.
+VALID_ORIGINS = {"private", "shared", "replay", "rem_dream", "hypothesis"}
+
+# VALID_RELATIONS: informational constant — lists known relation types including the new
+# "grounded_in" edge (Hypothesis node → Source node).  NOT enforced by validate_extraction
+# because the open-world set of LLM-generated relations cannot be exhaustively listed.
+VALID_RELATIONS = {
+    "calls", "imports", "uses", "defines", "implements", "extends",
+    "references", "documents", "tests", "depends_on", "contains",
+    "relates_to", "grounded_in",
+}
+
+# Weight mapping by confidence level — used by build.py when defaulting edge weight.
+CONFIDENCE_WEIGHT_DEFAULTS: dict[str, float] = {
+    "EXTRACTED": 1.0,
+    "INFERRED": 0.6,
+    "AMBIGUOUS": 0.3,
+}
+
 
 def validate_extraction(data: dict) -> list[str]:
     """
@@ -35,6 +55,31 @@ def validate_extraction(data: dict) -> list[str]:
                     f"Node {i} (id={node.get('id', '?')!r}) has invalid file_type "
                     f"'{node['file_type']}' - must be one of {sorted(VALID_FILE_TYPES)}"
                 )
+            # Stage 3 optional fields: validate when present, accept when absent.
+            if "weight" in node:
+                w = node["weight"]
+                if not isinstance(w, (int, float)) or not (0.0 <= float(w) <= 1.0):
+                    errors.append(
+                        f"Node {i} (id={node.get('id', '?')!r}) weight {w!r} "
+                        f"out of range [0.0, 1.0]"
+                    )
+            if "uses" in node and (not isinstance(node["uses"], int) or node["uses"] < 0):
+                errors.append(
+                    f"Node {i} (id={node.get('id', '?')!r}) 'uses' must be a non-negative int"
+                )
+            if "max_observed_degree" in node and (
+                not isinstance(node["max_observed_degree"], int)
+                or node["max_observed_degree"] < 0
+            ):
+                errors.append(
+                    f"Node {i} (id={node.get('id', '?')!r}) "
+                    f"'max_observed_degree' must be a non-negative int"
+                )
+            if "origin" in node and node["origin"] not in VALID_ORIGINS:
+                errors.append(
+                    f"Node {i} (id={node.get('id', '?')!r}) origin {node['origin']!r} "
+                    f"not in {sorted(VALID_ORIGINS)}"
+                )
 
     # Edges - accept "links" (NetworkX <= 3.1) as fallback for "edges"
     edge_list = data.get("edges") if "edges" in data else data.get("links")
@@ -60,6 +105,19 @@ def validate_extraction(data: dict) -> list[str]:
                 errors.append(f"Edge {i} source '{edge['source']}' does not match any node id")
             if "target" in edge and node_ids and edge["target"] not in node_ids:
                 errors.append(f"Edge {i} target '{edge['target']}' does not match any node id")
+            # Stage 3 optional edge fields: validate when present, accept when absent.
+            if "weight" in edge:
+                w = edge["weight"]
+                if not isinstance(w, (int, float)) or not (0.0 <= float(w) <= 1.0):
+                    errors.append(
+                        f"Edge {i} weight {w!r} out of range [0.0, 1.0]"
+                    )
+            if "uses" in edge and (not isinstance(edge["uses"], int) or edge["uses"] < 0):
+                errors.append(f"Edge {i} 'uses' must be a non-negative int")
+            if "origin" in edge and edge["origin"] not in VALID_ORIGINS:
+                errors.append(
+                    f"Edge {i} origin {edge['origin']!r} not in {sorted(VALID_ORIGINS)}"
+                )
 
     return errors
 

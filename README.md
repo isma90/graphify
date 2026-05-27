@@ -267,6 +267,11 @@ graphify prs --conflicts           # PRs sharing graph communities — merge-ord
 graphify init-sharing --default-remote git@github.com:org/repo.git .
 graphify push      # share your changes
 graphify pull      # sync teammates'
+
+# Sleep cycle (cognitive consolidation, alpha 0.10.0-alpha1)
+graphify sleep install --brain-root ~/brain       # set up nightly cycle (paste snippet into Hermes)
+graphify sleep demo                                # synchronous preview, ~30s
+graphify sleep status                              # last-run summary per phase
 ```
 
 See the [full command reference](#full-command-reference) below.
@@ -502,6 +507,20 @@ graphify install-merge-driver [<root>]
                                    # register .git/config + .gitattributes so graph-shared.json conflicts
                                    # auto-resolve via three_way_merge_nodes (idempotent)
 graphify uninstall-merge-driver [<root>]
+
+# Sleep cycle (cognitive consolidation) — see docs/sleep-cycle.md
+graphify sleep install [--brain-root <path>] [--schedule "0 2"] [--budget USD] [--phases 1,2,3,4,5]
+                                  # one-time setup: copies skill bundle to ~/.hermes/skills/sleep-cycle/,
+                                  # writes manifest at ~/.hermes/state/graphify-sleep.manifest.json,
+                                  # prints paste-into-chat snippet for Hermes cron registration
+graphify sleep status [--json]    # per-phase last run, deltas, errors (reads ~/.hermes/cron/output/)
+graphify sleep uninstall [--keep-state]
+                                  # remove bundle + manifest; print unregister snippet
+graphify sleep demo [--brain-root <path>]
+                                  # synchronous Phases 1+2 on fixture corpus, ~30s
+graphify sleep pause --tonight    # sentinel file; Phase 1 detects and skips for one night
+graphify touch <node-id> ...      # record touched-today nodes (Sprint 1 stub; serve.py hook lands Sprint 2)
+graphify stats [--json]           # graph health: nodes, edges, modularity Q, avg degree, breakdowns
 
 graphify claude install / uninstall
 graphify codex install / uninstall

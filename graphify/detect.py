@@ -1052,13 +1052,19 @@ def _md5_file(path: Path) -> str:
     return h.hexdigest()
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _migrate_manifest(data: dict) -> dict:
     """Migrate manifest schema v1 → v2 by stamping origin='private' (safest default)
     on entries that do not have the origin key.  Idempotent: if schema_version >= 2,
     no-op.
+
+    Note: SCHEMA_VERSION (currently 3) tracks the graph-node/edge schema introduced
+    by Stage 3 sleep-cycle fields.  The manifest schema is a separate versioning axis:
+    it only tracks file-tracking features (mtimes, hashes, origin).  The manifest
+    format did not change in Stage 3 — graph-level defaults are applied lazily in
+    build.build_merge() at graph-load time, not in the manifest.
 
     Args:
         data: Raw manifest dict loaded from disk.
@@ -1167,7 +1173,9 @@ def save_manifest(
 
     # Build the JSON payload.  schema_version=2 when privacy_map is active so
     # load_manifest() knows to run _migrate_manifest(); otherwise omit it to
-    # stay byte-compatible with v0.8.18 readers.
+    # stay byte-compatible with v0.8.18 readers.  The manifest schema version
+    # is a separate axis from SCHEMA_VERSION (graph node/edge schema); the
+    # manifest format did not change in Stage 3.
     output: dict = {}
     if privacy_map is not None:
         output["schema_version"] = 2

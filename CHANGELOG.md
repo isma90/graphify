@@ -2,6 +2,23 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.10.0-alpha1 (2026-05-27)
+
+Stage 3 Sprint 1: cognitive consolidation infrastructure for graphify knowledge graphs (sleep cycle). First of four sprints leading to 0.10.0 stable.
+
+- Feat: 5 new optional graph schema fields. Edges: `weight: float` (default by confidence — EXTRACTED=1.0, INFERRED=0.6, AMBIGUOUS=0.3), `last_used: float` (epoch), `uses: int`. Nodes: `created_at: float`, `max_observed_degree: int`. SCHEMA_VERSION bumped to 3 with a lazy v2→v3 migration handler that populates defaults on load (uses graph.json file mtime as the conservative `created_at` fallback for legacy graphs).
+- Feat: extended `origin` enum (Stage 2 added `'private'`/`'shared'`; now also accepts `'replay'`, `'rem_dream'`, `'hypothesis'`).
+- Feat: new `grounded_in` edge relation (directional: Hypothesis node → Source node).
+- Feat: `graphify stats [--json]` — graph health subcommand. Extends MCP `graph_stats` with modularity Q (cached per-process), average degree, breakdown by `confidence` and `origin`. JSON output for programmatic consumption.
+- Feat: `graphify touch <node-id> ...` — Sprint 1 stub. Writes touched node IDs to `$GRAPHIFY_TOUCH_LOG` (NDJSON). Full touch-logging hook in `serve.py:_query_graph_text` lands in Sprint 2.
+- Feat: `graphify sleep install` / `status` / `uninstall` / `demo` / `pause --tonight` subcommands. `install` copies the sleep-cycle skill bundle to `~/.hermes/skills/sleep-cycle/` via `importlib.resources` + version-aware clean copy, writes the cron job manifest, and prints a paste-into-chat snippet for Hermes cron registration. `demo` runs Phases 1+2 synchronously on a fixture corpus in ~30 seconds. `pause --tonight` writes a sentinel file Phase 1 checks before running.
+- Feat: sleep-cycle skill bundle at `graphify/sleep-cycle/` distributed via `MANIFEST.in` (sdist) and `pyproject.toml [tool.setuptools.package-data]` (wheel). Contents: SKILL.md, README.md, templates/safety_gates.md, templates/sleep_1_replay.md, templates/sleep_2_nrem.md.
+- Feat: split-mode refusal — eventual cycle subcommands (`decay`, `fuse`, `dream`, `hypothesize`, `briefing`) refuse to run on repos with overlays or a configured remote, with a clear error pointing to the tracking issue. Workaround flag `--force-split-mode-unsafe` arrives in Sprint 2.
+- Feat: per-job budget tracking in the cron manifest (`budget_usd`). Sprint 1-3 soft-tracks; Sprint 4+ opt-in `--budget-mode=hard`.
+- Docs: new `docs/sleep-cycle.md` conceptual prose. README "Sleep cycle" subsection in Full command reference + Common commands. All 12 platform skill files updated with `## For sleep cycle (Hermes integration)` section.
+- Tests: +21 net. New: `tests/test_validate_weight.py`, `tests/test_v2_to_v3_migration.py`, `tests/test_skill_bundle_distribution.py`, `tests/test_stats_cli.py`, `tests/test_touch_cli.py`, `tests/test_sleep_install.py`.
+- Packaging: `MANIFEST.in` added (`graft graphify/sleep-cycle`). `pyproject.toml [tool.setuptools.package-data]` extended with 3 sleep-cycle paths.
+
 ## 0.9.0 (2026-05-26)
 
 Stage 2 of the private/shared graph feature: the shared graph now syncs across teammates via the corpus's existing git remote, with conflicts auto-resolved by a registered git merge driver that delegates to `three_way_merge_nodes`. Private graph never leaves the machine. Legacy mode (single `graph.json`) is byte-identical to 0.8.18 for repos without overlays or a configured remote.

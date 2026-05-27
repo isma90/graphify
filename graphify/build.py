@@ -25,10 +25,11 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 from pathlib import Path
 import networkx as nx
-from .validate import validate_extraction
+from .validate import validate_extraction, CONFIDENCE_WEIGHT_DEFAULTS
 
 
 # Synonym mapper for known invalid file_type values that LLM subagents commonly
@@ -330,6 +331,23 @@ def build_merge(
         links_key = "links" if "links" in data else "edges"
         existing_nodes = list(data.get("nodes", []))
         existing_edges = list(data.get(links_key, []))
+        # Stage 3 — lazy migration: stamp sleep-cycle field defaults onto nodes/edges
+        # loaded from an existing (pre-v0.10) graph.json BEFORE they enter build().
+        # Using setdefault here means pre-existing values are never overwritten.
+        # created_at uses the graph file's mtime as a conservative proxy for node age
+        # (per design doc DX auto-decision #16 — mtime is better than 'now' for
+        # old nodes, avoiding skew in the morning briefing).
+        _graph_mtime = graph_path.stat().st_mtime
+        for _n in existing_nodes:
+            if isinstance(_n, dict):
+                _n.setdefault("created_at", _graph_mtime)
+                _n.setdefault("max_observed_degree", 0)
+        for _e in existing_edges:
+            if isinstance(_e, dict):
+                _conf = _e.get("confidence", "AMBIGUOUS")
+                _e.setdefault("weight", CONFIDENCE_WEIGHT_DEFAULTS.get(_conf, 0.3))
+                _e.setdefault("last_used", _graph_mtime)
+                _e.setdefault("uses", 0)
         base = [{"nodes": existing_nodes, "edges": existing_edges}]
     else:
         existing_nodes = []
@@ -337,6 +355,19 @@ def build_merge(
 
     all_chunks = base + list(new_chunks)
     G = build(all_chunks, directed=directed, dedup=dedup, dedup_llm_backend=dedup_llm_backend, root=root)
+
+    # Stage 3 — apply sleep-cycle defaults to any nodes/edges that were NOT
+    # pre-stamped above (i.e. nodes/edges introduced by new_chunks, or nodes from
+    # an empty-base first-run).  setdefault never overwrites pre-existing values.
+    _merge_now = time.time()
+    for _nid, _nattrs in G.nodes(data=True):
+        _nattrs.setdefault("created_at", _merge_now)
+        _nattrs.setdefault("max_observed_degree", 0)
+    for _u, _v, _eattrs in G.edges(data=True):
+        _conf = _eattrs.get("confidence", "AMBIGUOUS")
+        _eattrs.setdefault("weight", CONFIDENCE_WEIGHT_DEFAULTS.get(_conf, 0.3))
+        _eattrs.setdefault("last_used", _merge_now)
+        _eattrs.setdefault("uses", 0)
 
     # Prune nodes and edges from deleted source files
     if prune_sources:

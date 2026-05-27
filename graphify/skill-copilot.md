@@ -1432,6 +1432,88 @@ The MCP server currently does not auto-detect split mode — the user must pass 
 
 ---
 
+## For sleep cycle (Hermes integration)
+
+Sprint 1 alpha ships Phases 1+2 (Replay + NREM consolidation). Full 5-phase cycle (SHY decay, REM creative, Wake briefing) lands in 0.10.0-alpha2 → rc1 → 0.10.0 stable.
+
+### Mode detection
+
+If `~/.hermes/state/graphify-sleep.manifest.json` exists in the user's HOME, the sleep cycle is installed. Inspect with:
+
+```bash
+graphify sleep status --json
+```
+
+The JSON output lists each scheduled phase with last-run timestamp, exit code, deltas, and cost. If `graphify sleep status` returns "not installed" or the manifest is absent, the cycle is dormant.
+
+### When to suggest it
+
+The user benefits from the sleep cycle when:
+- They use Hermes as their primary agent
+- They run `graphify` against a personal knowledge graph (`~/brain` or equivalent)
+- Their `graph.json` is > 5000 nodes (smaller graphs don't need consolidation)
+- They commit `graphify-out/graph.json` to git (the cycle relies on per-phase git commits)
+
+Suggest it explicitly when the user asks "how do I keep my graph fresh overnight" or "how do I get morning briefings from my knowledge base."
+
+### Mental model
+
+- Hippocampus = `~/.hermes/MEMORY.md` (small, frozen per session, episodic)
+- Neocortex = `graphify-out/graph.json` (large, persistent, semantic)
+- The cycle moves consolidated knowledge from one to the other while the user sleeps.
+
+### Setup (one-time)
+
+```bash
+graphify sleep install --brain-root ~/brain
+# Paste the printed snippet into the user's Hermes chat session
+```
+
+The install command:
+1. Copies the skill bundle to `~/.hermes/skills/sleep-cycle/` via `importlib.resources` + `shutil.copytree` (version-aware: re-installs over a different version do a clean rmtree+copy)
+2. Writes the cron manifest to `~/.hermes/state/graphify-sleep.manifest.json` with Sprint 1's 2 jobs (Phases 1+2; more jobs added by future `graphify sleep install` after upgrades)
+3. Prints a paste-into-chat snippet starting with `cronjob(action="delete", name="sleep_*_*")` lines (safe re-paste) followed by `cronjob(action="create", ...)` for each job
+4. Reports: `[graphify sleep install] copied skill bundle to ~/.hermes/skills/sleep-cycle/ (version 0.10.0-alpha1)`
+
+### Day-to-day
+
+The cycle runs automatically each night at 02:00-05:00 UTC (configurable). No user action needed once installed. Each morning, MEMORY.md receives a new `Cortex YYYY-MM-DD HH:MM` entry (Sprint 4 ships this; Sprint 1 alpha-only stops at Phase 2 commit).
+
+Common requests and their commands:
+
+- "Show me last night's consolidation": `graphify sleep status --json`
+- "Skip tonight": `graphify sleep pause --tonight`
+- "Preview the cycle without waiting 24h": `graphify sleep demo --brain-root ~/brain`
+- "Inspect a dream hypothesis": `graphify explain "H: <label>"` (Sprint 4+)
+- "Remove the cycle entirely": `graphify sleep uninstall`
+
+### Side files
+
+| Path | Owner | Commit? |
+|---|---|---|
+| `graphify-out/graph.json` | the cycle (each phase commits) | YES |
+| `graphify-out/.graphify_touched.json` | query-side touch log (Sprint 2 hook) | NO (`.gitignore`) |
+| `~/brain/raw/day_<date>.md` | Phase 1 replay output | NO |
+| `~/brain/raw/dreams/<date>.md` | Phase 4 hypothesize justification (Sprint 3) | NO |
+| `~/.hermes/state/graphify-sleep.manifest.json` | install manifest | n/a |
+| `~/.hermes/skills/sleep-cycle/` | distributed skill bundle | n/a |
+| `~/.hermes/cron/output/<job_id>/cost.jsonl` | per-phase LLM cost tracking | n/a |
+
+### Rules (do / don't)
+
+- Never run `graphify push` (Stage 2) as a side-effect of the sleep cycle. The cycle operates on the local cortex; team sharing is a separate user-initiated flow.
+- Never call `nx.contracted_nodes()` directly — fusion happens via `graphify fuse` (Sprint 3) which has hyperedge-rewrite safety baked in.
+- When `.graphifyshared` or `.graphifyprivate` overlays exist (Stage 2 split mode), the sleep subcommands refuse to run with a clear error. Suggest the user either remove the overlays temporarily or use `--force-split-mode-unsafe` (Sprint 2+) which decays on the legacy graph only.
+- Never invoke `cronjob(action="create", ...)` directly to register sleep cycle jobs. The user pastes the snippet from `graphify sleep install` because the snippet includes the delete+create pattern for safe re-registration.
+- When the user reports "my MEMORY.md has multiple Cortex entries from today" — that's expected when the cycle ran more than once (e.g., user manually invoked `graphify sleep demo` then the cron also fired). Phase 5 (Wake, Sprint 4) cleans entries older than 7 days; same-day duplicates are intentional audit trail.
+- Surface upstream failures explicitly. If `graphify sleep status` shows `[failed: ...] sleep_4_rem`, do not silently re-run the user's morning briefing — read the cron output and explain what failed.
+
+### MCP server caveat
+
+`python -m graphify.serve <path>` accepts any single graph file. In sleep cycle context, point it at `graphify-out/graph.json` (the cycle's working file). The MCP server doesn't yet detect Hypothesis nodes specially; use `graphify explain "H: ..."` for that.
+
+---
+
 ## Honesty Rules
 
 - Never invent an edge. If unsure, use AMBIGUOUS.
