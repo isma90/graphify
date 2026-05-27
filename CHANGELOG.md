@@ -2,6 +2,17 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.10.0-alpha2 (2026-05-27)
+
+Stage 3 Sprint 2: SHY synaptic homeostasis (Phase 3 of the sleep cycle). Second of four sprints toward 0.10.0 stable.
+
+- Feat: `graphify decay [--rate 0.95] [--threshold 0.20] [--force-split-mode-unsafe] [<root>]` — Tononi-Cirelli synaptic homeostasis. Atomic read+clear of `.graphify_touched.json` (under `fcntl.flock`); multiplicative decay on non-EXTRACTED edges; +0.10 boost on edges with both endpoints touched today (`uses` increments, `last_used` updated); threshold removal of sub-`--threshold` INFERRED/AMBIGUOUS edges; orphan-node pruning that exempts god-nodes (`max_observed_degree > 20`) and nodes with any EXTRACTED incident edge; `max_observed_degree` updated per node; re-cluster with `--exclude-hubs 99`; commit ONLY `graphify-out/graph.json` via git plumbing (working tree never touched). EXTRACTED edges are NEVER decayed (AST-derived structure is the SHY-equivalent of structural synapses).
+- Feat: opt-in touch-logging hook in `serve.py:_query_graph_text`. Gated on `GRAPHIFY_TOUCH_LOG=<path>` env var. Buffered in memory (Python `set`) during traversal, single atomic-append write at end (NO per-visit fsync). NFS-safe — no `fcntl.flock` dependency for writes. Zero overhead when env var unset.
+- Feat: split-mode refusal on `graphify decay`. Repos with overlays (`.graphifyshared` / `.graphifyprivate`) or a configured remote get a clear error pointing to the tracking issue, with a `--force-split-mode-unsafe` opt-in flag that decays only the legacy `graph-out/graph.json` (skipping split files).
+- Feat: 3rd cron job added to `graphify sleep install` manifest (sleep_3_prune at 03:00 UTC, `context_from=sleep_2_nrem`, budget $0.20). Re-running install rewrites the manifest with the new job; re-paste the printed snippet in Hermes to register the third job.
+- Feat: new `templates/sleep_3_prune.md` template in the sleep-cycle bundle. Handles upstream `[failed: ...] nrem` markers gracefully (SHY is independent of consolidation per Complementary Learning Systems doctrine; the cortex doesn't stop renormalizing just because today's consolidation failed).
+- Tests: +13 net (1471 passing total; same 4 pre-existing fails). New: `tests/test_decay.py` (8: decay behavior, EXTRACTED exemption, threshold removal, god-node preservation, working-tree-safe commit, missing-graph error, touched-edge boost + log truncation), `tests/test_touch_logging.py` (3: env-unset zero overhead, env-set writes traversed nodes, unreadable path doesn't crash), `tests/test_decay_refuses_split_mode.py` (2: overlay refusal, `--force-split-mode-unsafe` proceeds).
+
 ## 0.10.0-alpha1 (2026-05-27)
 
 Stage 3 Sprint 1: cognitive consolidation infrastructure for graphify knowledge graphs (sleep cycle). First of four sprints leading to 0.10.0 stable.

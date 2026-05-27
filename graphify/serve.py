@@ -361,14 +361,27 @@ def _query_graph_text(
     token_budget: int = 2000,
     context_filters: list[str] | None = None,
 ) -> str:
+    import os as _os
+    _touch_log_path = _os.environ.get("GRAPHIFY_TOUCH_LOG", "").strip()
+    # Buffer touched node IDs in memory; None means env var unset → zero overhead.
+    touched: set[str] | None = set() if _touch_log_path else None
+
     terms = _query_terms(question)
     scored = _score_nodes(G, terms)
     start_nodes = _pick_seeds(scored)
     if not start_nodes:
+        if touched is not None and _touch_log_path:
+            # No nodes visited — nothing to log; skip write.
+            pass
         return "No matching nodes found."
     resolved_filters, filter_source = _resolve_context_filters(question, context_filters)
     traversal_graph = _filter_graph_by_context(G, resolved_filters)
     nodes, edges = _dfs(traversal_graph, start_nodes, depth) if mode == "dfs" else _bfs(traversal_graph, start_nodes, depth)
+
+    # Record all visited nodes into the in-memory buffer (single pass, no I/O).
+    if touched is not None:
+        touched.update(nodes)
+
     header_parts = [
         f"Traversal: {mode.upper()} depth={depth}",
         f"Start: {[G.nodes[n].get('label', n) for n in start_nodes]}",
@@ -377,7 +390,24 @@ def _query_graph_text(
         header_parts.append(f"Context: {', '.join(resolved_filters)} ({filter_source})")
     header_parts.append(f"{len(nodes)} nodes found")
     header = " | ".join(header_parts) + "\n\n"
-    return header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+    result = header + _subgraph_to_text(traversal_graph, nodes, edges, token_budget)
+
+    # Flush buffered touches: single atomic append at end (well under PIPE_BUF per line).
+    if touched is not None and _touch_log_path:
+        import time as _time
+        import json as _json
+        try:
+            with open(_touch_log_path, "a", encoding="utf-8") as _fh:
+                _ts = _time.time()
+                for _nid in sorted(touched):  # sorted for determinism in tests
+                    _fh.write(_json.dumps({"id": _nid, "ts": _ts}) + "\n")
+        except OSError as _e:
+            print(
+                f"[graphify query] warning: could not write touch log to {_touch_log_path}: {_e}",
+                file=sys.stderr,
+            )
+
+    return result
 
 
 def _find_node(G: nx.Graph, label: str) -> list[str]:

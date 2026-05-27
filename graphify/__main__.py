@@ -4125,14 +4125,14 @@ def main() -> None:
                 )
                 sys.exit(1)
 
-        # Default job definitions for Sprint 1
+        # Default job definitions (Sprint 1 = 2 jobs; Sprint 2 = 3 jobs)
         _SLEEP_DEFAULT_JOBS = [
             {
                 "name": "sleep_1_replay",
                 "base_schedule": "0 2 * * *",
                 "template": "templates/sleep_1_replay.md",
                 "context_from": None,
-                "budget_ratio": 0.10 / 3.10,
+                "budget_ratio": 0.10 / 3.30,
                 "default_budget_usd": 0.10,
             },
             {
@@ -4140,8 +4140,16 @@ def main() -> None:
                 "base_schedule": "15 2 * * *",
                 "template": "templates/sleep_2_nrem.md",
                 "context_from": "sleep_1_replay",
-                "budget_ratio": 3.00 / 3.10,
+                "budget_ratio": 3.00 / 3.30,
                 "default_budget_usd": 3.00,
+            },
+            {
+                "name": "sleep_3_prune",
+                "base_schedule": "0 3 * * *",
+                "template": "templates/sleep_3_prune.md",
+                "context_from": "sleep_2_nrem",
+                "budget_ratio": 0.20 / 3.30,
+                "default_budget_usd": 0.20,
             },
         ]
 
@@ -4629,6 +4637,288 @@ def main() -> None:
                 file=sys.stderr,
             )
             sys.exit(2)
+
+    elif cmd == "decay":
+        # ------------------------------------------------------------------ #
+        # graphify decay [--rate 0.95] [--threshold 0.20]                     #
+        #                [--exempt-extracted] [--force-split-mode-unsafe]      #
+        #                [<root>]                                               #
+        # Tononi SHY (Synaptic Homeostasis Hypothesis) downscaling:            #
+        # decays INFERRED/AMBIGUOUS edge weights, boosts touched edges,        #
+        # removes sub-threshold edges, prunes orphans, re-clusters, commits.  #
+        # ------------------------------------------------------------------ #
+        import argparse as _argparse
+        import fcntl as _fcntl
+        import subprocess as _decay_sp
+        import time as _decay_time
+        from networkx.readwrite import json_graph as _decay_jg
+        import networkx as _decay_nx
+
+        _parser = _argparse.ArgumentParser(
+            prog="graphify decay",
+            description="SHY downscaling: multiplicative weight decay + touched-edge boost.",
+        )
+        _parser.add_argument(
+            "--rate", type=float, default=0.95,
+            help="Multiplicative decay rate for non-EXTRACTED edges (default: 0.95)",
+        )
+        _parser.add_argument(
+            "--threshold", type=float, default=0.20,
+            help="Remove non-EXTRACTED edges whose weight falls below this value (default: 0.20)",
+        )
+        _parser.add_argument(
+            "--exempt-extracted", action="store_true", dest="exempt_extracted",
+            help="(No-op flag kept for forward compat; EXTRACTED edges are always exempt)",
+        )
+        _parser.add_argument(
+            "--force-split-mode-unsafe", action="store_true", dest="force_split_mode_unsafe",
+            help="Bypass split-mode refusal; operates only on legacy graph.json",
+        )
+        _parser.add_argument(
+            "root", nargs="?", default=".",
+            help="Repo root (default: cwd)",
+        )
+        _decay_args = _parser.parse_args(sys.argv[2:])
+        _decay_root = Path(_decay_args.root).resolve()
+
+        # ---- Split-mode detection ----------------------------------------- #
+        _decay_is_split = False
+        try:
+            from graphify.privacy import load_overlays as _load_overlays
+            _overlays = _load_overlays(_decay_root)
+            if _overlays.get("shared") or _overlays.get("private"):
+                _decay_is_split = True
+        except Exception:
+            # If privacy module errors out, be conservative: check file presence
+            for _sentinel_name in (".graphifyshared", ".graphifyprivate"):
+                _check = _decay_root
+                for _ in range(20):  # walk up to 20 ancestor levels
+                    if (_check / _sentinel_name).exists():
+                        _decay_is_split = True
+                        break
+                    _parent = _check.parent
+                    if _parent == _check:
+                        break
+                    _check = _parent
+                if _decay_is_split:
+                    break
+
+        if not _decay_is_split:
+            try:
+                from graphify.config import find_remote as _find_remote
+                if _find_remote(_decay_root) is not None:
+                    _decay_is_split = True
+            except Exception:
+                pass
+
+        if _decay_is_split and not _decay_args.force_split_mode_unsafe:
+            print(
+                "graphify decay: split mode (overlays or configured remote) is not yet fully supported by the sleep cycle.\n"
+                "Tracking: https://github.com/safishamsi/graphify/issues/TBD-split-mode-sleep\n"
+                "Workaround: --force-split-mode-unsafe applies decay to the legacy graph-out/graph.json only "
+                "(skipping graph-private.json / graph-shared.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _decay_is_split and _decay_args.force_split_mode_unsafe:
+            print(
+                "[graphify decay] --force-split-mode-unsafe: split-mode files "
+                "(graph-private.json, graph-shared.json) NOT decayed; only legacy graph.json processed.",
+                file=sys.stderr,
+            )
+
+        # ---- Load graph --------------------------------------------------- #
+        _decay_graph_path = _decay_root / "graphify-out" / "graph.json"
+        if not _decay_graph_path.exists():
+            print(
+                f"graphify decay: {_decay_graph_path} does not exist. Run 'graphify extract' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _decay_raw = json.loads(_decay_graph_path.read_text(encoding="utf-8"))
+        if "links" not in _decay_raw and "edges" in _decay_raw:
+            _decay_raw = dict(_decay_raw, links=_decay_raw["edges"])
+        try:
+            _decay_G = _decay_jg.node_link_graph(_decay_raw, edges="links")
+        except TypeError:
+            _decay_G = _decay_jg.node_link_graph(_decay_raw)
+
+        # ---- Read + clear touch log (atomic flock) ------------------------ #
+        _touch_log_path = _decay_root / "graphify-out" / ".graphify_touched.json"
+        _touched_set: set[str] = set()
+        if _touch_log_path.exists():
+            try:
+                with open(_touch_log_path, "r+", encoding="utf-8") as _tlf:
+                    try:
+                        _fcntl.flock(_tlf.fileno(), _fcntl.LOCK_EX)
+                    except (OSError, AttributeError):
+                        pass  # NFS / non-POSIX: best effort
+                    _tl_content = _tlf.read()
+                    for _tl_line in _tl_content.splitlines():
+                        _tl_line = _tl_line.strip()
+                        if not _tl_line:
+                            continue
+                        try:
+                            _tl_entry = json.loads(_tl_line)
+                            _nid_val = _tl_entry.get("id")
+                            if _nid_val:
+                                _touched_set.add(str(_nid_val))
+                        except (json.JSONDecodeError, AttributeError):
+                            pass
+                    # Truncate in same locked transaction
+                    _tlf.seek(0)
+                    _tlf.truncate(0)
+            except OSError as _tl_err:
+                print(
+                    f"[graphify decay] warning: could not read touch log {_touch_log_path}: {_tl_err}",
+                    file=sys.stderr,
+                )
+
+        # ---- Multiplicative decay + touch boost --------------------------- #
+        _now = _decay_time.time()
+        _DEFAULT_WEIGHT = {"EXTRACTED": 1.0, "INFERRED": 0.6, "AMBIGUOUS": 0.3}
+
+        # Counters per confidence tier
+        _stats: dict[str, dict[str, int]] = {
+            "EXTRACTED": {"decayed": 0, "removed": 0},
+            "INFERRED": {"decayed": 0, "removed": 0},
+            "AMBIGUOUS": {"decayed": 0, "removed": 0},
+        }
+        _boosted_count = 0
+
+        for _u, _v, _ed in _decay_G.edges(data=True):
+            _conf = _ed.get("confidence", "INFERRED")
+            _weight = _ed.get("weight", _DEFAULT_WEIGHT.get(_conf, 0.5))
+            if _conf != "EXTRACTED":
+                _weight *= _decay_args.rate
+                _stats.setdefault(_conf, {"decayed": 0, "removed": 0})["decayed"] += 1
+            # Boost if both endpoints were touched
+            if _u in _touched_set and _v in _touched_set:
+                _weight = min(1.0, _weight + 0.10)
+                _ed["uses"] = _ed.get("uses", 0) + 1
+                _ed["last_used"] = _now
+                _boosted_count += 1
+            _ed["weight"] = _weight
+
+        # ---- Threshold removal (non-EXTRACTED only) ----------------------- #
+        _to_remove: list[tuple] = []
+        for _u, _v, _ed in _decay_G.edges(data=True):
+            _conf = _ed.get("confidence", "INFERRED")
+            if _conf != "EXTRACTED" and _ed.get("weight", 1.0) < _decay_args.threshold:
+                _to_remove.append((_u, _v))
+                _stats.setdefault(_conf, {"decayed": 0, "removed": 0})["removed"] += 1
+        _decay_G.remove_edges_from(_to_remove)
+        _removed_edge_count = len(_to_remove)
+
+        # ---- Update max_observed_degree + orphan removal ------------------ #
+        for _nid, _nattrs in _decay_G.nodes(data=True):
+            _cur_deg = _decay_G.degree(_nid)
+            _nattrs["max_observed_degree"] = max(_nattrs.get("max_observed_degree", 0), _cur_deg)
+
+        _god_nodes: set[str] = {
+            _n for _n, _na in _decay_G.nodes(data=True)
+            if _na.get("max_observed_degree", 0) > 20
+        }
+
+        _has_extracted_edge: set[str] = set()
+        for _u, _v, _ed in _decay_G.edges(data=True):
+            if _ed.get("confidence") == "EXTRACTED":
+                _has_extracted_edge.add(_u)
+                _has_extracted_edge.add(_v)
+
+        _orphans = [
+            _n for _n in list(_decay_G.nodes())
+            if _decay_G.degree(_n) == 0
+            and _n not in _god_nodes
+            and _n not in _has_extracted_edge
+        ]
+        _decay_G.remove_nodes_from(_orphans)
+        _pruned_node_count = len(_orphans)
+
+        # ---- Re-cluster via subprocess ------------------------------------ #
+        try:
+            _cluster_result = _decay_sp.run(
+                [sys.executable, "-m", "graphify", "extract", "--cluster-only",
+                 "--exclude-hubs", "99", str(_decay_root)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            if _cluster_result.returncode != 0:
+                print(
+                    f"[graphify decay] warning: re-cluster returned non-zero: "
+                    f"{_cluster_result.stderr[:300]}",
+                    file=sys.stderr,
+                )
+        except Exception as _ce:
+            print(f"[graphify decay] warning: re-cluster failed: {_ce}", file=sys.stderr)
+
+        # ---- Save graph --------------------------------------------------- #
+        _decay_out_data = _decay_jg.node_link_data(_decay_G, edges="links")
+        _decay_graph_path.write_text(
+            json.dumps(_decay_out_data, ensure_ascii=False, indent=None),
+            encoding="utf-8",
+        )
+
+        # ---- Git commit (graph.json only) --------------------------------- #
+        try:
+            _decay_sp.run(
+                ["git", "add", "graphify-out/graph.json"],
+                cwd=str(_decay_root),
+                check=True,
+                capture_output=True,
+            )
+            _date_str = _decay_time.strftime("%Y-%m-%d")
+            _decay_sp.run(
+                [
+                    "git", "-c", "user.email=hermes-sleep@local",
+                    "-c", "user.name=Hermes Sleep",
+                    "commit", "-m", f"SHY downscaling {_date_str}",
+                    "graphify-out/graph.json",
+                ],
+                cwd=str(_decay_root),
+                check=True,
+                capture_output=True,
+            )
+        except _decay_sp.CalledProcessError as _gce:
+            print(
+                f"[graphify decay] warning: git commit failed: {_gce.stderr!r}",
+                file=sys.stderr,
+            )
+
+        # ---- Increment commits-this-night counter (best effort) ----------- #
+        try:
+            _counter_path = Path.home() / ".hermes" / "cron" / "output" / "sleep_3_prune" / "commits_this_night.txt"
+            _counter_path.parent.mkdir(parents=True, exist_ok=True)
+            _prev_count = 0
+            if _counter_path.exists():
+                try:
+                    _prev_count = int(_counter_path.read_text(encoding="utf-8").strip())
+                except ValueError:
+                    _prev_count = 0
+            _counter_path.write_text(str(_prev_count + 1) + "\n", encoding="utf-8")
+        except Exception as _cnt_err:
+            print(
+                f"[graphify decay] warning: could not update commits counter: {_cnt_err}",
+                file=sys.stderr,
+            )
+
+        # ---- Status output ------------------------------------------------ #
+        print(
+            f"[graphify decay] removed {_removed_edge_count} edges (weight < {_decay_args.threshold}), "
+            f"pruned {_pruned_node_count} orphan nodes, "
+            f"boosted {_boosted_count} touched edges"
+        )
+        print("[graphify decay]   EXTRACTED edges: untouched (always exempt)")
+        for _conf_name in ("INFERRED", "AMBIGUOUS"):
+            _cs = _stats.get(_conf_name, {"decayed": 0, "removed": 0})
+            print(
+                f"[graphify decay]   {_conf_name} edges:  "
+                f"{_cs['decayed']} decayed, {_cs['removed']} removed"
+            )
+        sys.exit(0)
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
         # User ran `graphify <path>` directly — treat as `graphify extract <path>`.
