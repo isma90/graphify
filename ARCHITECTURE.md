@@ -94,6 +94,74 @@ Repos without overlays AND without a configured remote stay in legacy mode and c
 | `INFERRED` | Relationship is a reasonable deduction (e.g., call-graph second pass, co-occurrence in context) |
 | `AMBIGUOUS` | Relationship is uncertain; flagged for human review in GRAPH_REPORT.md |
 
+## Sleep cycle data flow
+
+Stage 3 (graphify 0.10.0+) introduces a nightly 5-phase cognitive consolidation cycle that runs over `graph.json` via Hermes cron jobs. Each phase commits independently to git so the cycle is auditable and rollbackable.
+
+### Schema additions
+
+Five new optional fields ship in v0.10.0:
+
+| Field | Where | Default | Used by |
+|-------|-------|---------|---------|
+| `weight` | edge | 1.0 (EXTRACTED), 0.6 (INFERRED), 0.3 (AMBIGUOUS) | decay, briefing |
+| `last_used` | edge | epoch at edge creation | decay |
+| `uses` | edge | 0 | decay |
+| `created_at` | node | epoch at creation (file mtime fallback for legacy graphs) | briefing |
+| `max_observed_degree` | node | 0 | decay (god-node exemption from orphan removal) |
+
+Plus an extended `origin` enum (Stage 2 added `'private' | 'shared'`; Stage 3 adds `'replay'`, `'rem_dream'`, `'hypothesis'`) and a new `grounded_in` edge relation (directional: Hypothesis node → Source node).
+
+SCHEMA_VERSION 2 → 3 with lazy v0.9.0 → v0.10.0 migration in `detect.py:_migrate_manifest`. Legacy graphs missing the new fields receive conservative defaults at load time (file mtime as `created_at` to avoid skewing the briefing's "last 24h" filter).
+
+### Side files (transient, gitignored)
+
+| Path | Purpose | Owner phase |
+|------|---------|-------------|
+| `graphify-out/.graphify_touched.json` | NDJSON of node IDs visited during `graphify query` (gated on `GRAPHIFY_TOUCH_LOG` env var) | written by serve.py; consumed by decay |
+| `<brain_root>/raw/day_<date>.md` | Curated session_search output | written by Replay (Phase 1) |
+| `<brain_root>/raw/dreams/<date>.md` | Hypothesis justification log | written by hypothesize (Phase 4) |
+| `~/.hermes/state/graphify-sleep.manifest.json` | The cron job manifest (5 jobs per night by default) | written by `graphify sleep install` |
+| `~/.hermes/skills/sleep-cycle/` | Distributed skill bundle | copied by `graphify sleep install` via `importlib.resources` + `shutil.copytree` |
+| `~/.hermes/cron/output/<job_id>/cost.jsonl` | Per-phase LLM cost tracking | written by each phase template |
+| `~/.hermes/cron/output/<job_id>/commits_this_night.txt` | Cumulative commit counter for `git reset HEAD~<n>` rollback math | incremented by phases that commit (NREM, SHY, REM) |
+
+### Subcommands per phase
+
+| Phase | Time (UTC) | Subcommand | Mutates | Commits |
+|-------|------------|------------|---------|---------|
+| 1 Replay | 02:00 | (Hermes-side: session_search + graphify add) | brain_root/raw/ | no (Phase 2 commits the downstream extract) |
+| 2 NREM | 02:15 | `graphify extract --update --mode deep` + `--cluster-only` | graph.json | yes |
+| 3 SHY | 03:00 | `graphify decay` | graph.json | yes |
+| 4 REM | 03:30 | `graphify fuse` + `graphify dream` + `graphify hypothesize` (3 parallel `delegate_task` subagents) | graph.json | yes (one commit per subagent) |
+| 5 Wake | 04:30 | `graphify briefing` + Hermes `memory(add)` | MEMORY.md (Hermes-owned) | no |
+
+### Algorithms (research grounding)
+
+- **NREM**: incremental extraction + Leiden community re-detection
+- **SHY (decay)**: Tononi-Cirelli synaptic homeostasis (`weight *= rate`, threshold prune, god-node exemption)
+- **REM (fuse)**: KGGen iterative LLM clustering (Mo et al. arXiv:2502.09956)
+- **REM (dream)**: Graphusion novel-triplet inference between disconnected communities (Yang et al. arXiv:2407.10794)
+- **REM (hypothesize)**: Hypothesis nodes from `analyze.surprising_connections()` with directional `grounded_in` edges
+- **Wake (briefing)**: 1800-char Cortex synthesis (god nodes + recent hypotheses + surprising connection) added to MEMORY.md via `memory(action="add")` with minute-resolution timestamped header
+
+### Safety boundaries
+
+- **EXTRACTED edges are NEVER decayed or fused.** AST-derived structural relationships are stable; renormalizing them would corrupt source traceability.
+- **God nodes** (`max_observed_degree > 20`) are exempt from orphan removal during decay.
+- **Per-subagent safety gate**: each REM subagent exits code 2 if it produces > 50 net-new entities. Hermes template runs `git reset HEAD~<n>` (NEVER `--hard`) to roll back only this phase's commits.
+- **Working tree is never touched.** All commits use single-file staging + plumbing-friendly `git commit <path>` syntax. The user can be mid-edit at 03:00 AM and the cycle won't disturb unstaged changes.
+- **Split-mode refusal**: all cycle subcommands refuse to run on repos with Stage 2 overlays (`.graphifyshared` / `.graphifyprivate`) or a configured remote in `~/.graphify/config.toml`. The `--force-split-mode-unsafe` flag operates on legacy `graph-out/graph.json` only. Full split-mode-aware sleep is deferred to a hypothetical Stage 4.
+
+### Source references
+
+- `graphify/validate.py` — new optional field declarations + `grounded_in` relation
+- `graphify/build.py:build_merge` — lazy field population (file mtime fallback for `created_at` on legacy graphs)
+- `graphify/detect.py:_migrate_manifest` — v2 → v3 lazy migration
+- `graphify/serve.py:_query_graph_text` — buffered touch-logging hook
+- `graphify/__main__.py` — 7 cycle subcommands at lines 4633+ (`decay`, `fuse`, `dream`, `hypothesize`, `briefing`) and lines 3975+ (`touch`, `stats`); 6 sleep-mgmt subcommands at lines 4092+ (`sleep install/status/uninstall/demo/pause/resume`); `_SLEEP_DEFAULT_JOBS` manifest definition at line 4129
+- `graphify/sleep-cycle/` — skill bundle (SKILL.md + 5 templates + safety_gates.md + README.md)
+
 ## Adding a new language extractor
 
 1. Add a `extract_<lang>(path: Path) -> dict` function in `extract.py` following the existing pattern (tree-sitter parse → walk nodes → collect `nodes` and `edges` → call-graph second pass for INFERRED `calls` edges).

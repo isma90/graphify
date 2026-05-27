@@ -2,6 +2,51 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.10.0 (2026-05-27)
+
+Stage 3 Sprint 4 + stable release. Phase 5 Wake — morning briefing into MEMORY.md — closes the 5-phase sleep cycle end-to-end. This is the first stable release of the cognitive consolidation infrastructure.
+
+Sprint 4 deliverables:
+
+- Feat: `graphify briefing [--max-chars 1800] [--output -|<file>] [--force-split-mode-unsafe] [<root>]` — generates the ≤1800-char Cortex morning summary. Sections: timestamped `Cortex YYYY-MM-DD HH:MM` header (minute-resolution; uniqueness guaranteed against Hermes `memory(add)`); top 3-5 god nodes by degree; up to 2 Hypothesis nodes created in the last 24h (filtered by `source_file=dream_log.md` AND `created_at >= now - 86400`); one surprising connection from `GRAPH_REPORT.md` (or `analyze.surprising_connections()` fallback). Graceful empty-section messages for graphs without enough data. Truncates least-important sections first if over budget. READ-ONLY against the graph — no git commits.
+- Feat: 5th cron job added to `graphify sleep install` manifest (sleep_5_wake at 04:30 UTC, `context_from=sleep_4_rem`, budget $0.20). Total nightly budget $8.50. Re-running install rewrites the manifest with the 5th job; re-paste the printed Hermes snippet to register.
+- Feat: new `templates/sleep_5_wake.md` template in the sleep-cycle bundle. Reads `graphify briefing` output; pre-cleanup removes Cortex entries older than 7 days from MEMORY.md via `memory(action="remove", old_text=<full-entry>)`; calls `memory(action="add", content=BRIEFING_TEXT)` with the minute-timestamped header (NEVER `memory(replace)` — substring collision risk per /autoplan NEW-5 resolution); post-add cleanup if usage > 85% removes oldest entries while preserving today's; sends a morning notification via `send_message` to the user's configured channel. Wake NEVER skips silently — degraded briefing on upstream failure explicitly notes which phase broke.
+
+Stage 3 cumulative summary (alpha1 + alpha2 + rc1 + stable):
+
+- 7 new graphify CLI subcommands (`touch`, `stats`, `decay`, `fuse`, `dream`, `hypothesize`, `briefing`) + 5 sleep management subcommands (`sleep install/status/uninstall/demo/pause/resume`)
+- Schema additions: `weight`, `last_used`, `uses`, `created_at`, `max_observed_degree`; extended `origin` enum (`replay`, `rem_dream`, `hypothesis`); new `grounded_in` relation (directional: Hypothesis → Source). SCHEMA_VERSION 2 → 3 with lazy v0.9.0 → v0.10.0 migration (file-mtime fallback for `created_at`).
+- 5-phase sleep cycle: Replay (session_search → curated notes) → NREM (`graphify extract --update --mode deep` + re-cluster) → SHY (`graphify decay`: Tononi multiplicative decay + touched-edge boost + threshold prune + god-node-exempt orphan removal) → REM (parallel `fuse` KGGen + `dream` Graphusion + `hypothesize` Hypothesis nodes) → Wake (`graphify briefing` + `memory(add)` with timestamped headers + 7-day pre-cleanup + 85%-usage post-cleanup + `send_message`).
+- Skill bundle at `graphify/sleep-cycle/` distributed via `MANIFEST.in` (sdist) and `pyproject.toml [tool.setuptools.package-data]` (wheel). Bundle contains SKILL.md + README.md + 5 templates (one per phase) + safety_gates.md. Distributed via `graphify sleep install` (NOT `graphify install --platform hermes` — the bundle is its own opt-in artifact).
+- All cycle subcommands refuse split-mode (overlays / configured remote) by default; `--force-split-mode-unsafe` opt-in flag operates on legacy `graph-out/graph.json` only. Full split-mode-aware sleep is deferred to a hypothetical Stage 4.
+- Per-phase safety gates: each REM subagent (fuse/dream/hypothesize) exits code 2 if it produces > 50 net-new entities. Hermes templates roll back via `git reset HEAD~<n>` (NOT `--hard`, per safety_gates.md). NREM and Decay commit `graphify-out/graph.json` only (transient files in .gitignore). Working tree is NEVER touched (git plumbing only — `git add <file>` + `git commit <file>`).
+- Default backend Gemini Flash with `$0.50/night` soft cap (logged to `~/.hermes/cron/output/<job_id>/cost.jsonl`). Total nightly default budget `$8.50` (Phase 1=\$0.10, Phase 2=\$3.00, Phase 3=\$0.20, Phase 4=\$5.00, Phase 5=\$0.20).
+- Tests: 1521+ passing total (vs 1414 baseline); same 4 pre-existing failures (3 test_ollama + 1 test_incremental). Across the 4 sprints: 14 new test files added covering schema, packaging, every subcommand, hyperedge preservation in fuse, split-mode refusal in all cycle subcommands, working-tree-safe commits, idempotency, and graceful failure modes.
+- Docs: new `docs/sleep-cycle.md` (conceptual prose); README.md "Sleep cycle" subsection in Full command reference + Common commands; ARCHITECTURE.md "Sleep cycle data flow" section; all 12 platform skill files updated with `## For sleep cycle (Hermes integration)` (Sprint 1).
+
+Engineering fixes from /autoplan reviews
+
+- v2→v3 lazy migration in `detect.py:_migrate_manifest` (Decision #1)
+- NFS-safe buffered touch-logging (in-memory set + single append) instead of `fcntl.flock` (Decision #2)
+- `git reset HEAD~<n>` per-phase (NOT `git reset --hard`) on failure (Decision #3)
+- Path-traversal validation on `--brain-root` (Decision #4)
+- Chained alias→canonical fixed-point in `fuse` BEFORE `nx.contracted_nodes` (Decision #5)
+- `'contraction'` attribute artifact stripped after `nx.contracted_nodes` (json.dumps incompat)
+- `api_version` field in manifest (Decision #7)
+- Per-subagent safety gates in REM (NOT summed across — Decision #8)
+- Cached modularity Q (Decision #9)
+- `nx.DiGraph` cast in `hypothesize` to preserve `grounded_in` direction
+- Line-by-line state machine for surprising-connections section (replaced broken DOTALL regex)
+
+Out of scope (deferred follow-ups)
+
+- Optional Hermes memory provider plugin → 0.10.1
+- Split-mode-aware sleep (proper handling of graph-private.json + graph-shared.json during decay/fuse/dream) → hypothetical Stage 4
+- 31-language README translations of "Sleep cycle" section → docs follow-up
+- Empirical validation of dream-survival-rate vs Lin/Snell baselines (requires 4+ weeks of real overnight runs) → eval harness follow-up
+- Prometheus telemetry exporter (currently JSONL only) → optional follow-up
+- `dream --interactive` preview mode → Sprint 5 if needed
+
 ## 0.10.0-rc1 (2026-05-27)
 
 Stage 3 Sprint 3: Phase 4 REM creative recombination. Third of four sprints toward 0.10.0 stable. Adds the three LLM-driven subcommands that introduce novelty into the consolidated graph each night: synonym fusion (KGGen), novel triplet inference (Graphusion), and Hypothesis nodes.

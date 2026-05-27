@@ -4156,13 +4156,22 @@ def main() -> None:
                 "base_schedule": "30 3 * * *",
                 "template": "templates/sleep_4_rem.md",
                 "context_from": "sleep_3_prune",
-                "budget_ratio": 5.00 / 8.30,
+                "budget_ratio": 5.00 / 8.50,
                 "default_budget_usd": 5.00,
             },
+            {
+                "name": "sleep_5_wake",
+                "base_schedule": "30 4 * * *",
+                "template": "templates/sleep_5_wake.md",
+                "context_from": "sleep_4_rem",
+                "budget_ratio": 0.20 / 8.50,
+                "default_budget_usd": 0.20,
+            },
         ]
-        # Sprint 3 ratios re-balanced for 4 jobs (total $8.30 = $0.10 + $3.00 + $0.20 + $5.00)
-        _SLEEP_DEFAULT_JOBS[0]["budget_ratio"] = 0.10 / 8.30
-        _SLEEP_DEFAULT_JOBS[1]["budget_ratio"] = 3.00 / 8.30
+        # Sprint 4 ratios re-balanced for 5 jobs (total $8.50 = $0.10 + $3.00 + $0.20 + $5.00 + $0.20)
+        _SLEEP_DEFAULT_JOBS[0]["budget_ratio"] = 0.10 / 8.50
+        _SLEEP_DEFAULT_JOBS[1]["budget_ratio"] = 3.00 / 8.50
+        _SLEEP_DEFAULT_JOBS[2]["budget_ratio"] = 0.20 / 8.50
 
         def _sleep_build_jobs(
             phases: list[int],
@@ -6203,6 +6212,347 @@ def main() -> None:
             f"(max-hypotheses={_hyp_args.max_hypotheses}); "
             f"dream log at {_hyp_dream_log_path}"
         )
+        sys.exit(0)
+
+    elif cmd == "briefing":
+        # ------------------------------------------------------------------ #
+        # graphify briefing [--max-chars 1800] [--output -|<file>]           #
+        #                   [--force-split-mode-unsafe] [<root>]             #
+        # Generate condensed morning summary for MEMORY.md (Wake — Phase 5). #
+        # READ-ONLY: does NOT mutate graph.json or commit anything.           #
+        # ------------------------------------------------------------------ #
+        import argparse as _brief_argparse
+        import re as _brief_re
+        import time as _brief_time
+        from networkx.readwrite import json_graph as _brief_jg
+
+        _brief_parser = _brief_argparse.ArgumentParser(
+            prog="graphify briefing",
+            description="Generate morning briefing summary for MEMORY.md.",
+        )
+        _brief_parser.add_argument(
+            "--max-chars", type=int, default=1800, dest="max_chars",
+            help="Hard character cap for briefing output (default: 1800)",
+        )
+        _brief_parser.add_argument(
+            "--output", type=str, default="-", dest="output",
+            help="Output destination: '-' for stdout (default) or a file path",
+        )
+        _brief_parser.add_argument(
+            "--force-split-mode-unsafe", action="store_true", dest="force_split_mode_unsafe",
+            help="Bypass split-mode refusal; operates only on legacy graph.json",
+        )
+        _brief_parser.add_argument(
+            "root", nargs="?", default=".",
+            help="Repo root (default: cwd)",
+        )
+        _brief_args = _brief_parser.parse_args(sys.argv[2:])
+        _brief_root = Path(_brief_args.root).resolve()
+
+        # ---- Split-mode detection (mirrors hypothesize pattern) ------------ #
+        _brief_is_split = False
+        try:
+            from graphify.privacy import load_overlays as _brief_load_overlays
+            _brief_overlays = _brief_load_overlays(_brief_root)
+            if _brief_overlays.get("shared") or _brief_overlays.get("private"):
+                _brief_is_split = True
+        except Exception:
+            pass
+        if not _brief_is_split:
+            for _brief_sentinel_name in (".graphifyshared", ".graphifyprivate"):
+                _brief_check = _brief_root
+                for _ in range(20):
+                    if (_brief_check / _brief_sentinel_name).exists():
+                        _brief_is_split = True
+                        break
+                    _brief_parent = _brief_check.parent
+                    if _brief_parent == _brief_check:
+                        break
+                    _brief_check = _brief_parent
+                if _brief_is_split:
+                    break
+
+        if not _brief_is_split:
+            try:
+                from graphify.config import find_remote as _brief_find_remote
+                if _brief_find_remote(_brief_root) is not None:
+                    _brief_is_split = True
+            except Exception:
+                pass
+
+        if _brief_is_split and not _brief_args.force_split_mode_unsafe:
+            print(
+                "graphify briefing: split mode (overlays or configured remote) is not yet fully supported by the sleep cycle.\n"
+                "Tracking: https://github.com/safishamsi/graphify/issues/TBD-split-mode-sleep\n"
+                "Workaround: --force-split-mode-unsafe applies briefing to the legacy graph-out/graph.json only "
+                "(skipping graph-private.json / graph-shared.json).",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if _brief_is_split and _brief_args.force_split_mode_unsafe:
+            print(
+                "[graphify briefing] --force-split-mode-unsafe: split-mode files "
+                "(graph-private.json, graph-shared.json) NOT processed; only legacy graph.json processed.",
+                file=sys.stderr,
+            )
+
+        # ---- Load graph (READ-ONLY) ---------------------------------------- #
+        _brief_graph_path = _brief_root / "graphify-out" / "graph.json"
+        if not _brief_graph_path.exists():
+            print(
+                f"graphify briefing: {_brief_graph_path} does not exist. Run 'graphify extract' first.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        _brief_raw = json.loads(_brief_graph_path.read_text(encoding="utf-8"))
+        if "links" not in _brief_raw and "edges" in _brief_raw:
+            _brief_raw = dict(_brief_raw, links=_brief_raw["edges"])
+        try:
+            _brief_G = _brief_jg.node_link_graph(_brief_raw, edges="links")
+        except TypeError:
+            _brief_G = _brief_jg.node_link_graph(_brief_raw)
+
+        _brief_now = _brief_time.time()
+        _brief_timestamp = _brief_time.strftime("%Y-%m-%d %H:%M")
+
+        # ---- Helper: empty graph check ------------------------------------- #
+        _brief_graph_empty = (_brief_G.number_of_nodes() == 0)
+
+        # ---- Section A: Top 3-5 god nodes by current degree ---------------- #
+        _brief_god_lines: list[str] = []
+        if not _brief_graph_empty:
+            _brief_degree_list = sorted(
+                _brief_G.nodes(data=True),
+                key=lambda _nv: _brief_G.degree(_nv[0]),
+                reverse=True,
+            )
+            _brief_top_nodes = _brief_degree_list[:5]
+            # Only report nodes that are actually "hubs" (degree >= 2), minimum 3
+            _brief_hub_nodes = [
+                (_brief_nid, _brief_nattrs)
+                for _brief_nid, _brief_nattrs in _brief_top_nodes
+                if _brief_G.degree(_brief_nid) >= 1
+            ]
+            # Take 3-5: at least 3 if available, at most 5
+            _brief_god_candidates = _brief_hub_nodes[:5]
+            if len(_brief_god_candidates) < 3:
+                _brief_god_candidates = _brief_top_nodes[:3]
+            for _brief_gn, _brief_ga in _brief_god_candidates:
+                _brief_label = _brief_ga.get("label") or str(_brief_gn)
+                _brief_community = _brief_ga.get("community", "?")
+                _brief_god_lines.append(
+                    f"- {_brief_label} — central to community {_brief_community}"
+                )
+
+        # ---- Section B: Recent hypothesis nodes (last 24h) ----------------- #
+        _brief_hyp_lines: list[str] = []
+        if not _brief_graph_empty:
+            _brief_24h_ago = _brief_now - 86400
+            _brief_recent_hyps: list[tuple] = []
+            for _brief_hn, _brief_ha in _brief_G.nodes(data=True):
+                if (
+                    _brief_ha.get("source_file") == "dream_log.md"
+                    and _brief_ha.get("created_at", 0) >= _brief_24h_ago
+                ):
+                    _brief_recent_hyps.append((_brief_hn, _brief_ha))
+            # Sort by created_at descending, take up to 2 most recent
+            _brief_recent_hyps.sort(
+                key=lambda _hv: _hv[1].get("created_at", 0), reverse=True
+            )
+            _brief_recent_hyps = _brief_recent_hyps[:2]
+
+            for _brief_hn, _brief_ha in _brief_recent_hyps:
+                _brief_hyp_label = _brief_ha.get("label") or str(_brief_hn)
+                # Find grounded_in edges where hypothesis is source
+                _brief_gi_targets: list[str] = []
+                for _brief_eu, _brief_ev, _brief_eed in _brief_G.edges(
+                    _brief_hn, data=True
+                ):
+                    if _brief_eed.get("relation") == "grounded_in":
+                        _brief_tgt_attrs = _brief_G.nodes.get(_brief_ev, {})
+                        _brief_tgt_label = _brief_tgt_attrs.get("label") or str(_brief_ev)
+                        _brief_gi_targets.append(_brief_tgt_label)
+                # Also check reversed edges for undirected graphs
+                if not _brief_G.is_directed():
+                    for _brief_eu, _brief_ev, _brief_eed in _brief_G.edges(data=True):
+                        if (
+                            _brief_eed.get("relation") == "grounded_in"
+                            and _brief_eu == _brief_hn
+                            and _brief_ev not in _brief_gi_targets
+                        ):
+                            _brief_tgt_attrs = _brief_G.nodes.get(_brief_ev, {})
+                            _brief_tgt_label = _brief_tgt_attrs.get("label") or str(_brief_ev)
+                            _brief_gi_targets.append(_brief_tgt_label)
+                _brief_gi_targets = _brief_gi_targets[:2]
+                if _brief_gi_targets:
+                    _brief_hyp_lines.append(
+                        f"- {_brief_hyp_label}: grounded in {', '.join(_brief_gi_targets)}"
+                    )
+                else:
+                    _brief_hyp_lines.append(f"- {_brief_hyp_label}")
+
+        # ---- Section C: Surprising connection of the day ------------------- #
+        _brief_surprise_line: str = ""
+        _brief_report_path = _brief_root / "graphify-out" / "GRAPH_REPORT.md"
+        if _brief_report_path.exists():
+            _brief_report_text = _brief_report_path.read_text(encoding="utf-8")
+            _brief_report_lines = _brief_report_text.splitlines()
+            _brief_surprise_section: list[str] = []
+            _brief_in_surprise = False
+            _brief_header_re = _brief_re.compile(r"^#{1,6}\s+", _brief_re.IGNORECASE)
+            for _brief_rl in _brief_report_lines:
+                if _brief_header_re.match(_brief_rl):
+                    if _brief_re.search(r"surprising", _brief_rl, _brief_re.IGNORECASE):
+                        _brief_in_surprise = True
+                        continue
+                    elif _brief_in_surprise:
+                        break
+                if _brief_in_surprise:
+                    _brief_surprise_section.append(_brief_rl)
+            # Extract first bullet from section
+            for _brief_sl in _brief_surprise_section:
+                _brief_sl_stripped = _brief_sl.strip()
+                if _brief_sl_stripped.startswith(("-", "*")):
+                    _brief_surprise_line = _brief_sl_stripped[1:].strip()
+                    break
+
+        if not _brief_surprise_line:
+            # Fallback: call surprising_connections directly
+            try:
+                from graphify.analyze import surprising_connections as _brief_sc_fn
+                _brief_fb_communities: dict[int, list[str]] = {}
+                for _brief_fn, _brief_fa in _brief_G.nodes(data=True):
+                    _brief_fc = _brief_fa.get("community")
+                    if _brief_fc is not None:
+                        try:
+                            _brief_fc_int = int(_brief_fc)
+                        except (TypeError, ValueError):
+                            continue
+                        _brief_fb_communities.setdefault(_brief_fc_int, []).append(str(_brief_fn))
+                _brief_sc_results = _brief_sc_fn(_brief_G, _brief_fb_communities, top_n=1)
+                if _brief_sc_results:
+                    _brief_sc_item = _brief_sc_results[0]
+                    _brief_sc_src = _brief_sc_item.get("source", "")
+                    _brief_sc_tgt = _brief_sc_item.get("target", "")
+                    _brief_sc_why = (
+                        _brief_sc_item.get("why")
+                        or _brief_sc_item.get("note")
+                        or ""
+                    )
+                    if _brief_sc_src and _brief_sc_tgt:
+                        _brief_surprise_line = (
+                            f"{_brief_sc_src} ↔ {_brief_sc_tgt}"
+                            + (f" ({_brief_sc_why})" if _brief_sc_why else "")
+                        )
+            except Exception:
+                pass
+
+        # ---- Compose briefing markdown ------------------------------------- #
+        _brief_sections: list[str] = []
+
+        # God nodes section
+        if _brief_graph_empty:
+            _brief_sections.append("God nodes: (no data)")
+        elif _brief_god_lines:
+            _brief_sections.append("God nodes:\n" + "\n".join(_brief_god_lines))
+        else:
+            _brief_sections.append("God nodes: (graph too small to identify hubs)")
+
+        # Hypotheses section
+        if _brief_graph_empty:
+            _brief_sections.append("Hypotheses worth reviewing: (no data)")
+        elif _brief_hyp_lines:
+            _brief_sections.append(
+                "Hypotheses worth reviewing:\n" + "\n".join(_brief_hyp_lines)
+            )
+        else:
+            _brief_sections.append(
+                "Hypotheses worth reviewing: (none yet — run a few more nights)"
+            )
+
+        # Surprising connection section
+        if _brief_graph_empty:
+            _brief_sections.append("Surprising connection of the day: (no data)")
+        elif _brief_surprise_line:
+            _brief_sections.append(
+                f"Surprising connection of the day:\n- {_brief_surprise_line}"
+            )
+        else:
+            _brief_sections.append(
+                "Surprising connection of the day: (none found today — check back tomorrow)"
+            )
+
+        _brief_legend = "For details: /graphify query <topic>"
+
+        _brief_body = (
+            f"Cortex {_brief_timestamp}\n\n"
+            + "\n\n".join(_brief_sections)
+            + f"\n\n{_brief_legend}"
+        )
+
+        # ---- Enforce --max-chars cap --------------------------------------- #
+        _brief_max = _brief_args.max_chars
+        if len(_brief_body) > _brief_max:
+            # Truncation strategy: drop hypotheses section first, then god nodes,
+            # always preserve header + legend + truncation marker.
+            _brief_header_line = f"Cortex {_brief_timestamp}"
+            _brief_ellipsis = "..."
+            _brief_footer = f"\n\n{_brief_legend}"
+            # Reserved chars: header + blank line + ellipsis line + blank + footer
+            _brief_reserved = len(_brief_header_line) + 2 + len(_brief_ellipsis) + 2 + len(_brief_footer)
+
+            # Try dropping hypotheses section
+            _brief_sections_trimmed = [
+                s for s in _brief_sections
+                if not s.startswith("Hypotheses worth reviewing")
+            ]
+            _brief_body_no_hyp = (
+                f"Cortex {_brief_timestamp}\n\n"
+                + "\n\n".join(_brief_sections_trimmed)
+                + f"\n\n{_brief_legend}"
+            )
+            if len(_brief_body_no_hyp) <= _brief_max:
+                _brief_body = _brief_body_no_hyp
+            else:
+                # Also drop god nodes section
+                _brief_sections_minimal = [
+                    s for s in _brief_sections
+                    if not s.startswith("Hypotheses worth reviewing")
+                    and not s.startswith("God nodes")
+                ]
+                _brief_body_minimal = (
+                    f"Cortex {_brief_timestamp}\n\n"
+                    + "\n\n".join(_brief_sections_minimal)
+                    + f"\n\n{_brief_legend}"
+                )
+                if len(_brief_body_minimal) <= _brief_max:
+                    _brief_body = _brief_body_minimal
+                else:
+                    # Hard truncate to fit, always end with legend + ellipsis marker
+                    _brief_budget = _brief_max - len(_brief_footer) - len(_brief_ellipsis) - 2
+                    _brief_body = (
+                        f"Cortex {_brief_timestamp}\n\n"[:_brief_budget]
+                        + _brief_ellipsis
+                        + _brief_footer
+                    )
+
+            # Final safety: if still over, hard-truncate with ellipsis
+            if len(_brief_body) > _brief_max:
+                _brief_body = _brief_body[: _brief_max - len(_brief_ellipsis)] + _brief_ellipsis
+
+        # ---- Output -------------------------------------------------------- #
+        if _brief_args.output == "-":
+            print(_brief_body)
+        else:
+            _brief_out_path = Path(_brief_args.output)
+            _brief_out_path.write_text(_brief_body, encoding="utf-8")
+            print(
+                f"[graphify briefing] wrote {len(_brief_body)} chars to {_brief_out_path}",
+                file=sys.stderr,
+            )
+
         sys.exit(0)
 
     elif Path(cmd).exists() or cmd in (".", "..") or cmd.startswith(("./", "../", "/", "~")):
