@@ -32,6 +32,18 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify query "<question>" --budget 1500            # cap answer at N tokens
 /graphify path "AuthModule" "Database"                # shortest path between two concepts
 /graphify explain "SwinTransformer"                   # plain-language explanation of a node
+graphify init-sharing [--default-remote <url>] [--non-interactive] [<root>]
+                                                      # one-time team-sharing setup: writes .graphifyshared /
+                                                      # .graphifyprivate overlays, records remote in
+                                                      # ~/.graphify/config.toml, installs git merge driver
+graphify push [--branch <name>] [--message <msg>] [<root>]
+                                                      # publish local graph-shared.json to the configured remote
+                                                      # (git plumbing — never touches your working tree)
+graphify pull [--branch <name>] [<root>]              # fetch + three-way-merge the remote shared graph;
+                                                      # conflicts written to graphify-out/.graphify_shared_conflicts.json
+graphify remote {add|remove|list} ...                 # manage the per-repo entry in ~/.graphify/config.toml
+graphify install-merge-driver [<root>]                # register the git merge driver for graph-shared.json
+graphify uninstall-merge-driver [<root>]              # remove it
 ```
 
 ## What graphify is for
@@ -52,6 +64,16 @@ Use it for:
 ## What You Must Do When Invoked
 
 If the user invoked `/graphify --help` or `/graphify -h` (with no other arguments), print the contents of the `## Usage` section above verbatim and stop. Do not run any commands, do not detect files, do not default the path to `.`. Just print the Usage block and return.
+
+**Fast path — existing graph:** Before doing anything else, check the filesystem for an existing graph in this order:
+
+1. `graphify-out/graph-shared.json` and `graphify-out/graph-private.json` — **split mode**, the repo is team-sharing enabled. Load both; merge for in-memory queries so the user sees the union, but never propose writes that move nodes between them. The `origin` attribute on every node and every edge tells you which bucket it came from.
+2. `graphify-out/graph.json` — **legacy mode**, single graph. Use as today.
+3. Neither — run the full pipeline.
+
+The expected location is `graphify-out/` relative to the **current working directory** (i.e. the project root where you are running commands). If a graph exists (split or legacy) AND the user's request is a natural-language question about the codebase (e.g. "How does X work?", "What calls Y?", "Trace the data flow through Z") and NOT an explicit rebuild command (`--update`, `--cluster-only`, or a bare path/URL that implies fresh extraction): **skip Steps 1–5 entirely and jump straight to `## For /graphify query`.** Run `graphify query "<question>"` immediately. Do not run detect. Do not check corpus size. Do not ask the user to narrow. The graph is already built — use it.
+
+When you see split mode, you can suggest `graphify push` after the user makes changes they want to share, or `graphify pull` to fetch teammates' updates. Never invoke push/pull without an explicit user instruction or clear intent — they touch the git remote.
 
 If no path was given, use `.` (current directory). Do not ask the user for a path.
 
@@ -1287,6 +1309,108 @@ This writes a `## graphify` section to the local `CLAUDE.md` that instructs Clau
 ```bash
 graphify claude uninstall  # remove the section
 ```
+
+---
+
+## For team sharing (split mode)
+
+Use when the repo has a private/shared split — `graph-private.json` stays local, `graph-shared.json` syncs to teammates via git.
+
+### Mode detection
+
+Detect mode from the filesystem before running graphify. The repo is in **split mode** if ANY of:
+
+- Both `graphify-out/graph-shared.json` AND `graphify-out/graph-private.json` exist on disk.
+- `.graphifyshared` or `.graphifyprivate` exists in the repo root or any ancestor up to the git root.
+- A config entry exists for this repo in `~/.graphify/config.toml` (check via `graphify remote list | grep "$(pwd)"`).
+
+Otherwise the repo is in **legacy mode** (single `graph.json`). Quick decision tree:
+
+```bash
+if [ -f graphify-out/graph-shared.json ] && [ -f graphify-out/graph-private.json ]; then
+    : "split mode — load both"
+elif [ -f graphify-out/graph.json ]; then
+    : "legacy mode — load single graph"
+else
+    : "run /graphify to create one"
+fi
+```
+
+### Mental model
+
+`graph-private.json` stays on this machine and is never pushed. `graph-shared.json` syncs to teammates via the repo's git remote on a side branch (default `graphify/shared`). Files matched by `.graphifyshared` patterns produce shared nodes; everything else produces private nodes. Cross-bucket edges (and hyperedges with any private member) live in the private graph only — the shared graph never reveals which private files exist or how they connect.
+
+### First-time setup
+
+For a user wanting to enable sharing on a repo that currently produces a single `graph.json`:
+
+```bash
+# from the repo root
+graphify init-sharing --default-remote git@github.com:org/repo.git .
+
+# tell graphify which paths are shareable (gitignore-style patterns)
+echo "src/**"  >> .graphifyshared
+echo "docs/**" >> .graphifyshared
+
+# commit the overlays so teammates inherit the classification
+git add .graphifyshared .graphifyprivate .gitattributes
+git commit -m "enable graphify team sharing"
+```
+
+`graphify init-sharing` writes the two overlay files, records the remote in `~/.graphify/config.toml`, and installs the git merge driver (only if `<root>` is inside a git repo). Then `graphify extract .` (or `/graphify`) produces both `graph-private.json` and `graph-shared.json`.
+
+### Day-to-day
+
+```bash
+graphify extract .   # produces both files (incremental against existing ones)
+graphify push        # publish your shared graph to the team
+graphify pull        # fetch teammates' changes (three-way merged automatically)
+```
+
+`graphify push` uses git plumbing — it builds a commit object directly and pushes to the configured branch. It does NOT touch your working tree or `HEAD`, so it is safe to run mid-edit. After a successful push, `graphify-out/.graphify_shared_base` is updated to the new SHA.
+
+`graphify pull` fetches the remote shared branch, runs a three-way merge using `.graphify_shared_base` as the base, and writes the merged result back to `graph-shared.json`. Any attribute conflicts the auto-merger could not resolve are written to `graphify-out/.graphify_shared_conflicts.json`.
+
+### Conflict handling
+
+When `graphify pull` writes `graphify-out/.graphify_shared_conflicts.json`, the file is a JSON list of unresolved conflicts:
+
+```json
+[
+  {"id": "node-id", "base": {...}, "ours": {...}, "theirs": {...}},
+  ...
+]
+```
+
+Each entry shows the merge base attrs, the local (`ours`) attrs, and the remote (`theirs`) attrs. Surface this file to the user explicitly — do not silently move on. The user resolves by either editing `graph-shared.json` directly OR by re-extracting the affected source files locally and pushing again. After resolution, delete `graphify-out/.graphify_shared_conflicts.json` so the next pull starts clean.
+
+### Side files
+
+| Path | Purpose | Commit? |
+|---|---|---|
+| `graphify-out/graph-private.json` | Local-only graph for private files | NO |
+| `graphify-out/graph-shared.json` | Synced graph for shared files | YES |
+| `.graphifyshared`, `.graphifyprivate` | Overlay classification (gitignore-style patterns) | YES (commit so teammates inherit) |
+| `graphify-out/.graphify_shared_base` | Sync watermark (last-pushed/pulled SHA) | NO (add to `.gitignore`) |
+| `graphify-out/.graphify_shared_conflicts.json` | Last-pull's unresolved conflicts | NO (add to `.gitignore`) |
+| `~/.graphify/config.toml` | Per-repo remote config | n/a — lives in `$HOME` |
+
+### Rules (do / don't)
+
+- Never propose moving a node between buckets without an explicit user instruction. The way to reclassify a file is to edit `.graphifyshared` or `.graphifyprivate` and re-run `graphify extract` — not to hand-edit either graph file.
+- Never read `graph-private.json` from `git show` or any other git command — it is local-only and never committed; those queries will fail or read a stale artefact.
+- Never invoke `graphify push` as a side-effect of any other action. Always confirm with the user before pushing — it touches the team's git remote.
+- When the user asks "show me X" and X spans both buckets, query both files and report the union. Tell the user the result combines private + shared. Don't silently filter to one bucket.
+- When `graphify-out/.graphify_shared_conflicts.json` exists, surface its contents before any further `graphify pull` — the file represents unresolved sync state that the next pull will overwrite.
+
+### MCP server caveat
+
+`python -m graphify.serve <path>` accepts any single graph file. In split mode, choose:
+
+- `graphify-out/graph-shared.json` if the assistant only needs the shareable subgraph (e.g. when the LLM session might surface answers to teammates).
+- `graphify-out/graph-private.json` for full-fidelity local queries that include private-only nodes and the cross-bucket edges.
+
+The MCP server currently does not auto-detect split mode — the user must pass the desired graph path explicitly.
 
 ---
 

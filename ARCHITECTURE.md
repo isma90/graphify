@@ -47,6 +47,45 @@ Every extractor returns:
 
 `validate.py` enforces this schema before `build_graph()` consumes it.
 
+## Split graph format
+
+When the repo has `.graphifyshared` / `.graphifyprivate` overlays OR a configured remote in `~/.graphify/config.toml`, the pipeline produces **two** graph files instead of one:
+
+- `graphify-out/graph-private.json` — local-only. Contains all nodes whose source file is NOT matched by `.graphifyshared`.
+- `graphify-out/graph-shared.json` — synced via git. Contains nodes whose source file IS matched by `.graphifyshared`.
+
+Both graphs follow the same node-link format as `graph.json`, with one additional attribute on every node AND every edge:
+
+- `origin: "private" | "shared"` — which bucket this node/edge came from.
+
+Cross-bucket edges (source in one bucket, target in the other) live in the **private** graph only. Hyperedges with any private member also live in private only. The shared graph never reveals which private files exist or how they connect to shared structure.
+
+Repos without overlays AND without a configured remote stay in legacy mode and continue to produce a single `graph.json`, byte-identical to 0.8.18.
+
+### Side files
+
+| Path | Purpose | Tracked by git? |
+|---|---|---|
+| `graphify-out/graph-private.json` | Private bucket graph | NO (add to `.gitignore`) |
+| `graphify-out/graph-shared.json` | Shared bucket graph | YES (committed; merge-driver-aware) |
+| `graphify-out/.graphify_shared_base` | Last-pushed-or-pulled SHA; base for the next three-way merge | NO (add to `.gitignore`) |
+| `graphify-out/.graphify_shared_conflicts.json` | List of `{id, base, ours, theirs}` from the last `graphify pull` | NO (add to `.gitignore`) |
+| `.graphifyshared`, `.graphifyprivate` | Overlay patterns (gitignore-style) | YES (commit so teammates inherit) |
+| `~/.graphify/config.toml` | Per-repo remote URL/branch config | n/a — lives in `$HOME`, never in the repo |
+
+### Manifest v2
+
+`graphify-out/.graphify_manifest.json` carries `schema_version: 2` and a per-file `origin` field when split mode is active. Lazy v1→v2 migration runs on load: v1 entries are stamped `origin: "private"` by default.
+
+### Source code references
+
+- `graphify/privacy.py` — `classify_paths`, `is_legacy_mode`, `load_overlays`. The classifier reuses `_parse_gitignore_line` and `_find_vcs_root` from `detect.py`.
+- `graphify/extract.py:split_extraction_by_origin` — splits the merged extraction by bucket. `compute_bucket_migration_prune_ids` returns node IDs to prune from a bucket when a file moves to the other bucket between extracts.
+- `graphify/build.py:three_way_merge_nodes(base, ours, theirs, *, max_nodes, dedup) -> (merged_graph, conflicts)` — the sync merge core, also delegated-to by the `graphify merge-driver` subcommand.
+- `graphify/config.py` — TOML reader/writer for `~/.graphify/config.toml` (override via `GRAPHIFY_CONFIG`).
+- `graphify/git_integration.py` — git plumbing wrappers (`install_merge_driver`, `commit_shared_via_plumbing` which never touches the working tree, `fetch_shared`, `push_branch`).
+- `graphify/__main__.py:2344-2396` — `merge-driver` subcommand registered as `merge=graphify-shared` in `.gitattributes`.
+
 ## Confidence labels
 
 | Label | Meaning |

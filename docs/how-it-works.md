@@ -96,3 +96,52 @@ Each edge has:
 - `source_file` — where the relationship was found
 
 Hyperedges (group relationships connecting 3+ nodes) live in `G.graph["hyperedges"]`.
+
+---
+
+## Team sync (split mode)
+
+### Why two graphs
+
+Think of `.graphifyshared` as `.gitignore` for the knowledge graph. Some files in a repo are meant for the whole team — production code, public docs, design notes. Others are not — scratch experiments, half-finished refactors, vendor secrets, your personal TODO file. graphify already respects `.graphifyignore` for "don't index this at all," but split mode adds a second axis: "index it, but keep it local."
+
+When `.graphifyshared` (or a configured remote in `~/.graphify/config.toml`) is present, graphify produces two files instead of one. `graph-shared.json` is what teammates pull; `graph-private.json` is what you query locally. The shared graph is constructed so it never leaks which private files exist — no `source_file` references into private paths, no community membership that would imply a hidden node, no edges that point at something a teammate cannot see.
+
+### The trust boundary
+
+The split is not just a filter applied at export time; it is a hard partition that flows through the whole pipeline. Cross-bucket edges (an import from a public file into a private helper, a `calls` edge from a shared function to a private utility) live in the **private** graph only. Hyperedges that include any private member do the same. This means `graph-shared.json` is a STRICT subgraph of the full union — never a teaser, never an alias, never a placeholder.
+
+The trade-off is honest: queries run against `graph-shared.json` alone will sometimes show shared nodes as "isolated" when, in your local view, they actually have private neighbours. That asymmetry is the price of the privacy guarantee. Use `graph-private.json` locally to see the full picture; share `graph-shared.json` confident that it cannot betray what's on your machine.
+
+### How sync works
+
+`graphify push` writes the local `graph-shared.json` to a side branch (default `graphify/shared`) on the same git remote that hosts the corpus. It uses git's low-level plumbing (`update-ref`, `hash-object`, `commit-tree`) so it never touches your working tree — no checkout, no merge, no stray file. The SHA it just published is recorded in `graphify-out/.graphify_shared_base`, which becomes the common ancestor for the next merge.
+
+`graphify pull` fetches the same side branch, reads the SHA in `.graphify_shared_base` as the base, and runs `three_way_merge_nodes(base, ours, theirs)`. Conflicts — nodes where you and a teammate both edited the same attribute to different values — are RECORDED, not failed-on. They go into `graphify-out/.graphify_shared_conflicts.json` as a list of `{id, base, ours, theirs}` entries for you to resolve at your own pace. The merge itself always succeeds; the file you read next is a valid graph.
+
+There is one more sync path to know about. When you and a teammate both edit `graph-shared.json` and both `git pull` the corpus, git itself encounters a merge. `init-sharing` installs a merge driver in `.git/config` that registers `graph-shared.json` as `merge=graphify-shared` in `.gitattributes`. When git triggers the driver, it shells out to `graphify merge-driver`, which delegates to the same `three_way_merge_nodes`. The net effect: concurrent edits to the shared graph union cleanly, without you ever seeing conflict markers in JSON.
+
+### ASCII flow
+
+```text
+   ┌─────────────────────────────────────────────────────────────┐
+   │  graphify init-sharing --default-remote <url> .             │
+   │  echo "src/**" >> .graphifyshared                           │
+   │  echo "docs/**" >> .graphifyshared                          │
+   └────────────────┬────────────────────────────────────────────┘
+                    │
+                    ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  graphify extract  →  graph-private.json + graph-shared.json│
+   └────────────────┬────────────────────────────────────────────┘
+                    │
+                    ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  graphify push    →  commits graph-shared.json to side branch│
+   └────────────────┬────────────────────────────────────────────┘
+                    │  (teammate's session)
+                    ▼
+   ┌─────────────────────────────────────────────────────────────┐
+   │  graphify pull    →  three-way merge; conflicts to JSON file │
+   └─────────────────────────────────────────────────────────────┘
+```

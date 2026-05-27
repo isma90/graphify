@@ -262,6 +262,11 @@ graphify prs                       # PR dashboard: CI state, review status, work
 graphify prs 42                    # deep dive on PR #42 with graph impact
 graphify prs --triage              # AI ranks your review queue (uses whatever backend is configured)
 graphify prs --conflicts           # PRs sharing graph communities — merge-order risk
+
+# Team sharing (optional — see "Private vs. shared graph" below)
+graphify init-sharing --default-remote git@github.com:org/repo.git .
+graphify push      # share your changes
+graphify pull      # sync teammates'
 ```
 
 See the [full command reference](#full-command-reference) below.
@@ -479,6 +484,24 @@ graphify uninstall --project --platform codex  # remove project-scoped install f
 graphify hook install              # post-commit + post-checkout hooks
 graphify hook uninstall
 graphify hook status
+
+# Team sharing (split mode) — see "Private vs. shared graph (split mode)" above
+graphify init-sharing [--default-remote <url>] [--non-interactive] [<root>]
+                                   # one-time setup: writes .graphifyshared / .graphifyprivate overlays,
+                                   # records the remote in ~/.graphify/config.toml, installs git merge driver
+graphify push [--branch <name>] [--message <msg>] [<root>]
+                                   # publish local graph-shared.json to the configured git remote
+                                   # (git plumbing — never touches your working tree)
+graphify pull [--branch <name>] [<root>]
+                                   # fetch + three-way-merge teammates' changes; conflicts written to
+                                   # graphify-out/.graphify_shared_conflicts.json
+graphify remote add <url> [--branch <b>] [--shared-path <p>] [--remote-name <n>] [<root>]
+graphify remote remove [<root>]
+graphify remote list               # list all per-repo remote entries from ~/.graphify/config.toml
+graphify install-merge-driver [<root>]
+                                   # register .git/config + .gitattributes so graph-shared.json conflicts
+                                   # auto-resolve via three_way_merge_nodes (idempotent)
+graphify uninstall-merge-driver [<root>]
 
 graphify claude install / uninstall
 graphify codex install / uninstall
