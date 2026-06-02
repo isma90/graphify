@@ -158,8 +158,9 @@ Install only what you need:
 | `leiden` | Leiden community detection (Python < 3.13 only) | `pip install "graphifyy[leiden]"` |
 | `ollama` | Ollama local inference | `pip install "graphifyy[ollama]"` |
 | `openai` | OpenAI / OpenAI-compatible APIs | `pip install "graphifyy[openai]"` |
-| `gemini` | Google Gemini API | `pip install "graphifyy[gemini]"` |
+| `gemini` | Google Gemini API (AI Studio) | `pip install "graphifyy[gemini]"` |
 | `bedrock` | AWS Bedrock (uses IAM, no API key) | `pip install "graphifyy[bedrock]"` |
+| `vertex` | Google Vertex AI (uses ADC, no API key) | `pip install "graphifyy[vertex]"` |
 | `sql` | SQL schema extraction | `pip install "graphifyy[sql]"` |
 | `all` | Everything above | `pip install "graphifyy[all]"` |
 
@@ -397,6 +398,9 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 | `GRAPHIFY_OLLAMA_NUM_CTX` | Override Ollama KV-cache window size | optional — auto-sized by default |
 | `GRAPHIFY_OLLAMA_KEEP_ALIVE` | Minutes to keep Ollama model loaded | optional — set `0` to unload after each chunk |
 | `AWS_*` / `~/.aws/credentials` | AWS Bedrock — standard credential chain | `--backend bedrock` (no API key, uses IAM) |
+| `GOOGLE_CLOUD_PROJECT` (+ `GOOGLE_CLOUD_LOCATION`) | Google Vertex AI — project/region; auth via ADC (`gcloud auth application-default login`) or `GOOGLE_APPLICATION_CREDENTIALS` | `--backend vertex` (no API key, uses ADC) |
+| `GOOGLE_GENAI_USE_VERTEXAI` | Set `true` to auto-detect the `vertex` backend | optional — otherwise pass `--backend vertex` |
+| `GRAPHIFY_VERTEX_MODEL` | Override the Vertex model (default `gemini-2.5-flash`) | optional |
 | `GRAPHIFY_MAX_WORKERS` | AST parallelism thread count | optional — also `--max-workers` flag |
 | `GRAPHIFY_MAX_OUTPUT_TOKENS` | Raise output cap for dense corpora | optional — e.g. `32768` for large files |
 | `GRAPHIFY_API_TIMEOUT` | HTTP timeout in seconds (default: 600) | optional — also `--api-timeout` flag |
@@ -411,7 +415,7 @@ These are only needed for **headless / CI extraction** (`graphify extract`). Whe
 
 - **Code files** — processed locally via tree-sitter. Nothing leaves your machine.
 - **Video / audio** — transcribed locally with faster-whisper. Nothing leaves your machine.
-- **Docs, PDFs, images** — sent to your AI assistant for semantic extraction (via the `/graphify` skill, using whatever model your IDE session runs). Headless `graphify extract` requires `GEMINI_API_KEY` / `GOOGLE_API_KEY` (Gemini), `MOONSHOT_API_KEY` (Kimi), `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (OpenAI), `DEEPSEEK_API_KEY` (DeepSeek), a running Ollama instance (`OLLAMA_BASE_URL`), AWS credentials via the standard provider chain (Bedrock - no API key needed, uses IAM), or the `claude` CLI binary (Claude Code - no API key needed, uses your Claude subscription). The `--dedup-llm` flag uses the same key.
+- **Docs, PDFs, images** — sent to your AI assistant for semantic extraction (via the `/graphify` skill, using whatever model your IDE session runs). Headless `graphify extract` requires `GEMINI_API_KEY` / `GOOGLE_API_KEY` (Gemini), `MOONSHOT_API_KEY` (Kimi), `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (OpenAI), `DEEPSEEK_API_KEY` (DeepSeek), a running Ollama instance (`OLLAMA_BASE_URL`), AWS credentials via the standard provider chain (Bedrock - no API key needed, uses IAM), Google Cloud ADC + `GOOGLE_CLOUD_PROJECT` (Vertex AI - no API key needed, uses ADC), or the `claude` CLI binary (Claude Code - no API key needed, uses your Claude subscription). The `--dedup-llm` flag uses the same key.
 - No telemetry, no usage tracking, no analytics.
 
 ---
@@ -554,12 +558,13 @@ graphify kiro install / uninstall
 graphify antigravity install / uninstall
 
 graphify extract ./docs                        # headless LLM extraction for CI (no IDE needed)
-graphify extract ./docs --backend gemini       # explicit backend: gemini, kimi, claude, openai, deepseek, ollama, bedrock, or claude-cli
+graphify extract ./docs --backend gemini       # explicit backend: gemini, kimi, claude, openai, deepseek, ollama, bedrock, vertex, or claude-cli
 graphify extract ./docs --backend gemini --model gemini-3.1-pro-preview
 graphify extract ./docs --backend ollama       # local Ollama (set OLLAMA_BASE_URL / OLLAMA_MODEL) - no API key needed for loopback
 GRAPHIFY_OLLAMA_NUM_CTX=32768 graphify extract ./docs --backend ollama   # override KV-cache window (auto-sized by default)
 GRAPHIFY_OLLAMA_KEEP_ALIVE=0 graphify extract ./docs --backend ollama    # unload model after each chunk (saves VRAM on small GPUs)
 graphify extract ./docs --backend bedrock      # AWS Bedrock via IAM - no API key, uses AWS credential chain
+graphify extract ./docs --backend vertex       # Google Vertex AI via ADC - no API key (set GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION)
 graphify extract ./docs --backend claude-cli   # route through Claude Code CLI - no API key, uses your Claude subscription
 graphify extract ./docs --max-workers 16       # AST parallelism (also GRAPHIFY_MAX_WORKERS)
 graphify extract ./docs --token-budget 30000   # smaller semantic chunks for local/small models

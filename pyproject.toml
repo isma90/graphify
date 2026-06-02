@@ -63,8 +63,9 @@ ollama = ["openai"]
 bedrock = ["boto3"]
 gemini = ["openai", "tiktoken"]
 openai = ["openai", "tiktoken"]
+vertex = ["google-genai"]
 sql = ["tree-sitter-sql"]
-all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper", "yt-dlp", "matplotlib", "openai", "tiktoken", "boto3", "tree-sitter-sql"]
+all = ["mcp", "neo4j", "pypdf", "markdownify", "watchdog", "graspologic; python_version < '3.13'", "python-docx", "openpyxl", "faster-whisper", "yt-dlp", "matplotlib", "openai", "tiktoken", "boto3", "google-genai", "tree-sitter-sql"]
 
 [project.scripts]
 graphify = "graphify.__main__:main"

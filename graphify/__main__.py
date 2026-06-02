@@ -1758,7 +1758,7 @@ def main() -> None:
         print("    --top-k-edges N         per-symbol outbound edges in inspector (default 12)")
         print("    --label NAME            project label in header")
         print("  extract <path>          headless full extraction (AST + semantic LLM) for CI/scripts")
-        print("    --backend B             gemini|kimi|claude|openai|deepseek|ollama (default: whichever API key is set)")
+        print("    --backend B             gemini|kimi|claude|openai|deepseek|ollama|vertex (default: whichever API key is set)")
         print("    --model M               override backend default model")
         print("    --max-workers N         AST extraction subprocess count (default: cpu_count)")
         print("    --token-budget N        per-chunk token cap for semantic extraction (default: 60000)")
@@ -3171,8 +3171,8 @@ def main() -> None:
         # has an API key set.
         if len(sys.argv) < 3:
             print(
-                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama] "
-                "[--model M] [--out DIR] [--google-workspace] [--no-cluster] "
+                "Usage: graphify extract <path> [--backend gemini|kimi|claude|openai|deepseek|ollama|vertex] "
+                "[--model M] [--out DIR] [--group NAME] [--google-workspace] [--no-cluster] "
                 "[--max-workers N] [--token-budget N] [--max-concurrency N] "
                 "[--api-timeout S]",
                 file=sys.stderr,
@@ -3350,6 +3350,20 @@ def main() -> None:
                     or os.environ.get("AWS_DEFAULT_REGION")
                     or os.environ.get("AWS_ACCESS_KEY_ID")
                 )
+            elif backend == "vertex":
+                # Vertex authenticates via ADC, not a static key; project is required.
+                allow_no_key = bool(
+                    os.environ.get("GOOGLE_CLOUD_PROJECT")
+                    or os.environ.get("VERTEX_PROJECT")
+                    or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI")
+                )
+                if not allow_no_key:
+                    print(
+                        "error: backend 'vertex' requires GOOGLE_CLOUD_PROJECT (and ADC via "
+                        "`gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS).",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
             elif backend == "claude-cli":
                 import shutil as _shutil
                 allow_no_key = _shutil.which("claude") is not None

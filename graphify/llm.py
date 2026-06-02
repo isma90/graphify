@@ -105,6 +105,16 @@ BACKENDS: dict[str, dict] = {
         "temperature": 0,
         "max_tokens": 16384,
     },
+    "vertex": {
+        # Google Vertex AI via the native google-genai SDK (vertexai=True).
+        # No base_url / env_key: the SDK builds the endpoint from project+location
+        # and authenticates via ADC (gcloud ADC or GOOGLE_APPLICATION_CREDENTIALS).
+        "default_model": "gemini-2.5-flash",
+        "model_env_key": "GRAPHIFY_VERTEX_MODEL",
+        "pricing": {"input": 0.30, "output": 2.50},  # USD per 1M tokens (gemini-2.5-flash on Vertex; estimate)
+        "temperature": 0,
+        "max_tokens": 16384,
+    },
     "claude-cli": {
         # Routes through the locally-installed `claude` CLI (Claude Code) using
         # `-p --output-format json`. Authenticates via the user's existing
@@ -530,6 +540,67 @@ def _call_bedrock(model: str, user_message: str, max_tokens: int = 8192) -> dict
     return result
 
 
+def _call_vertex(model: str, user_message: str, max_tokens: int = 8192) -> dict:
+    """Call Google Vertex AI via the native google-genai SDK (vertexai=True).
+
+    Authenticates via Application Default Credentials (ADC), which transparently
+    covers both ``gcloud auth application-default login`` and a service-account
+    JSON pointed to by ``GOOGLE_APPLICATION_CREDENTIALS``. Project/region come
+    from ``GOOGLE_CLOUD_PROJECT`` / ``GOOGLE_CLOUD_LOCATION`` (the SDK's standard
+    env vars; ``VERTEX_PROJECT`` / ``VERTEX_LOCATION`` accepted as aliases).
+    """
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise ImportError(
+            "Vertex AI extraction requires google-genai. Run: pip install graphifyy[vertex]"
+        ) from exc
+
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("VERTEX_PROJECT")
+    location = (
+        os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or os.environ.get("VERTEX_LOCATION")
+        or "us-central1"
+    )
+    if not project:
+        raise ValueError(
+            "Vertex backend requires GOOGLE_CLOUD_PROJECT (and ADC via "
+            "`gcloud auth application-default login` or GOOGLE_APPLICATION_CREDENTIALS)."
+        )
+
+    # vertexai=True routes to Vertex (not AI Studio) and authenticates via ADC.
+    client = genai.Client(vertexai=True, project=project, location=location)
+    resp = client.models.generate_content(
+        model=model,
+        contents=user_message,
+        config=types.GenerateContentConfig(
+            system_instruction=_EXTRACTION_SYSTEM,
+            temperature=0,
+            max_output_tokens=max_tokens,
+            response_mime_type="application/json",
+        ),
+    )
+
+    raw_content = getattr(resp, "text", None)
+    result = _parse_llm_json(raw_content or "{}")
+    usage = getattr(resp, "usage_metadata", None)
+    result["input_tokens"] = getattr(usage, "prompt_token_count", 0) or 0
+    result["output_tokens"] = getattr(usage, "candidates_token_count", 0) or 0
+    result["model"] = model
+    candidates = getattr(resp, "candidates", None)
+    finish = getattr(candidates[0], "finish_reason", None) if candidates else None
+    result["finish_reason"] = "length" if str(finish).endswith("MAX_TOKENS") else "stop"
+    if _response_is_hollow(raw_content, result) and result["finish_reason"] != "length":
+        print(
+            "[graphify] vertex returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
+    return result
+
+
 def extract_files_direct(
     files: list[Path],
     backend: str = "kimi",
@@ -560,7 +631,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "vertex"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -575,6 +646,8 @@ def extract_files_direct(
         return _call_claude_cli(user_msg, max_tokens=max_out)
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out)
+    if backend == "vertex":
+        return _call_vertex(mdl, user_msg, max_tokens=max_out)
     return _call_openai_compat(
         cfg["base_url"],
         key,
@@ -1091,17 +1164,22 @@ def _validate_ollama_base_url(url: str) -> None:
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
-    Priority: gemini → kimi → claude → openai → bedrock → ollama (last, opt-in).
+    Priority: gemini → kimi → claude → openai → deepseek → vertex → bedrock →
+    ollama (last, opt-in).
 
-    Ollama is intentionally checked LAST so a paid API key (Anthropic/OpenAI/etc.)
-    is never silently shadowed by an incidental OLLAMA_BASE_URL in the environment
-    — see security finding F-002/F-029. Setting OLLAMA_BASE_URL alongside a paid
-    key now keeps you on the paid backend; remove the paid key (or pass
-    --backend ollama explicitly) to route to the local model.
+    Cloud-credential backends (vertex, bedrock) are checked AFTER the static
+    API-key backends so a paid key (Anthropic/OpenAI/Gemini-AI-Studio/etc.) is
+    never silently shadowed. Vertex auto-detection requires the explicit
+    GOOGLE_GENAI_USE_VERTEXAI flag (not a bare GOOGLE_CLOUD_PROJECT, which is
+    commonly set in any GCP shell); use `--backend vertex` to select it
+    otherwise. Ollama is checked LAST for the same anti-shadowing reason — see
+    security finding F-002/F-029.
     """
     for backend in ("gemini", "kimi", "claude", "openai", "deepseek"):
         if _get_backend_api_key(backend):
             return backend
+    if os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").strip().lower() in ("1", "true", "yes"):
+        return "vertex"
     if os.environ.get("AWS_PROFILE") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
         return "bedrock"
     ollama_url = os.environ.get("OLLAMA_BASE_URL")

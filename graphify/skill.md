@@ -108,7 +108,8 @@ The skill pipeline writes all intermediate and final outputs to `graphify-out/` 
 graphify extract ./core/     # → ./core/graphify-out/graph.json
 graphify extract ./service/  # → ./service/graphify-out/graph.json
 graphify extract ./platform/ # → ./platform/graphify-out/graph.json
-# Add --backend gemini|kimi|openai|deepseek|claude-cli depending on which API key you have set
+# Add --backend gemini|kimi|openai|deepseek|vertex|claude-cli depending on which API key / cloud creds you have set
+# (vertex = Google Vertex AI via ADC; set GOOGLE_CLOUD_PROJECT + GOOGLE_CLOUD_LOCATION, no API key)
 
 # Then merge at the project root:
 graphify merge-graphs \

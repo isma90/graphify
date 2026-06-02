@@ -2,6 +2,17 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased — Google Vertex AI backend (`--backend vertex`)
+
+New LLM provider for headless extraction targeting **Google Vertex AI** (GCP), distinct from the existing AI-Studio `gemini` backend. Additive — no existing backend changes.
+
+- Feat: `vertex` backend in `graphify/llm.py` using the native **`google-genai` SDK with `vertexai=True`**. New `_call_vertex()` mirrors `_call_bedrock()` (dedicated call fn, late SDK import with `pip install graphifyy[vertex]` hint, response normalized to the common nodes/edges/tokens/finish_reason contract, hollow-response → retry handling).
+- Feat: authenticates via **Application Default Credentials (ADC)** — transparently covers both `gcloud auth application-default login` and a service-account JSON via `GOOGLE_APPLICATION_CREDENTIALS`. Project/region from `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION` (aliases `VERTEX_PROJECT` / `VERTEX_LOCATION`; default region `us-central1`). Default model `gemini-2.5-flash`, override via `GRAPHIFY_VERTEX_MODEL`.
+- Feat: `detect_backend()` auto-selects `vertex` only when `GOOGLE_GENAI_USE_VERTEXAI=true` (checked in the cloud-credential tier, after static API keys, so a paid Gemini/OpenAI/etc. key is never shadowed; a bare `GOOGLE_CLOUD_PROJECT` does NOT auto-trigger it). `--backend vertex` selects it explicitly. `extract_files_direct` exempts vertex from the static-key requirement and routes to `_call_vertex`; the `extract` CLI preflight allows no key when a project is configured.
+- Packaging: optional extra `vertex = ["google-genai"]` (also added to `all`). Surfaced in `--backend` help/usage, README (extras + env-var tables + examples + privacy note), and `skill.md`.
+- Tests: +11 (`tests/test_vertex_backend.py`) — registration/pricing, detection (flag-gated, no shadowing, bare-project no-autodetect), `_call_vertex` parsing + MAX_TOKENS→length + missing-project + missing-SDK ImportError, dispatch + model override + no-key exemption (google-genai mocked via `sys.modules`).
+- Deferred: non-Gemini Vertex Model Garden models (Anthropic/Llama); Vertex OpenAI-compat endpoint (native SDK chosen instead).
+
 ## Unreleased — Central knowledge groups (`graphify project`)
 
 Graphs can now live centrally at `~/.graphify/<group>/` under a user-chosen semantic name (a client / project / platform) instead of being tied to the scanned repo's `graphify-out/`. A group **accumulates** knowledge from multiple sources into a single growing graph, and each group dir is its own git repo (so the sleep cycle, backups, and versioning work there). Fully opt-in: repos not assigned to a group keep the byte-identical local `graphify-out/` behavior.
