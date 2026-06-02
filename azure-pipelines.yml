@@ -1,0 +1,108 @@
+# Pipeline de release del fork tecnoandina-graphify.
+#
+# Dispara en tags `v*` (ej. v0.10.1): construye el wheel y lo publica como
+# Universal Package en Azure Artifacts (org tecnoandinaspa). yana-server baja ese
+# paquete por versión y lo sirve al CLI vía `yana graf install`.
+#
+# Requisitos en Azure DevOps (una vez):
+#   - Repo espejado en Azure DevOps Repos (ver AZURE_DISTRIBUTION.md).
+#   - Feed de Azure Artifacts (default abajo: `tecnoandinaspa`) con permiso de
+#     publish para el service account del pipeline.
+
+trigger:
+  tags:
+    include:
+      - 'v*'
+  branches:
+    include:
+      - v8
+      - main
+
+pr:
+  branches:
+    include:
+      - v8
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - name: pythonVersion
+    value: '3.12'
+  # Feed de Azure Artifacts donde se publica el Universal Package.
+  # Formato: '<feed>' (org-scoped) o '<project>/<feed>' (project-scoped). Ajustar.
+  - name: artifactsFeed
+    value: 'tecnoandinaspa'
+  - name: packageName
+    value: 'graphify'
+
+stages:
+  - stage: test
+    displayName: Test
+    jobs:
+      - job: pytest
+        strategy:
+          matrix:
+            py310: { pythonVersion: '3.10' }
+            py312: { pythonVersion: '3.12' }
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+          - script: |
+              python -m pip install --upgrade pip
+              pip install -e ".[mcp,pdf,watch,sql]"
+              pip install pytest
+            displayName: Install deps
+          - script: python -m pytest tests/ -q --tb=short
+            displayName: Run tests
+          - script: |
+              graphify --help
+              graphify install
+            displayName: Verify CLI end-to-end
+
+  - stage: publish
+    displayName: Build & publish wheel
+    dependsOn: test
+    condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+    jobs:
+      - job: build_publish
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+
+          - script: |
+              python -m pip install --upgrade pip build
+              python -m build
+            displayName: Build wheel + sdist
+
+          - script: |
+              set -euo pipefail
+              # Versión = tag sin la 'v' inicial (v0.10.1 -> 0.10.1).
+              TAG="$(Build.SourceBranchName)"
+              VERSION="${TAG#v}"
+              echo "##vso[task.setvariable variable=packageVersion]$VERSION"
+              # sha256 del wheel (para auditoría / verificación cruzada).
+              WHEEL=$(ls dist/*.whl | head -n1)
+              SHA=$(sha256sum "$WHEEL" | cut -d' ' -f1)
+              echo "wheel=$WHEEL sha256=$SHA version=$VERSION"
+              echo "$SHA  $(basename "$WHEEL")" > dist/SHA256SUMS
+            displayName: Resolve version + sha256
+
+          - task: UniversalPackages@0
+            displayName: Publish Universal Package
+            inputs:
+              command: publish
+              publishDirectory: 'dist'
+              feedsToUsePublish: 'internal'
+              vstsFeedPublish: '$(artifactsFeed)'
+              vstsFeedPackagePublish: '$(packageName)'
+              versionOption: 'custom'
+              versionPublish: '$(packageVersion)'
+              packagePublishDescription: 'tecnoandina-graphify wheel + sdist (release $(Build.SourceBranchName))'
+
+          - publish: dist
+            artifact: graphify-dist
+            displayName: Publish build artifact (dist/)
