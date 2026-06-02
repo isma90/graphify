@@ -30,3 +30,6 @@ scripts/benchmark_kimi*.py
 
 # oh-my-claudecode local state (project memory + sessions)
 .omc/
+
+# drawio autosave backups (transient)
+.$*.bkp
