@@ -121,6 +121,19 @@ graphify merge-graphs \
 
 Once `graphify-out/graph.json` exists, the fast path above takes over: any codebase question runs `graphify query` directly on the merged graph — no re-extraction, no size gate.
 
+**Central knowledge groups (a client / platform / project spanning several repos):**
+
+To concentrate many repos under one named, central, *growing* graph instead of a per-repo `graphify-out/`, use a knowledge group (its own git repo at `~/.graphify/<name>/`). Prefer this over `merge-graphs` when the user wants one accumulating graph for "everything about <client/project>":
+
+```bash
+graphify project create <name> --from ./first-repo   # creates ~/.graphify/<name>/ (git repo) and seeds it
+graphify project add ./another-repo --group <name>    # accumulates into the SAME graph (ids not namespaced)
+graphify project list --verbose                        # name, sources, node count
+graphify query "<question>" --group <name>             # also path/explain --group
+```
+
+Ungrouped repos keep the default local `graphify-out/` behavior. Full reference + migration (`graphify project import`) + limitations: `docs/central-groups.md`.
+
 ### Step 1 - Ensure graphify is installed
 
 ```bash

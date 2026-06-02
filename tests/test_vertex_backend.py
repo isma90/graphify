@@ -143,6 +143,18 @@ def test_call_vertex_max_tokens_maps_to_length(monkeypatch, fake_genai):
     assert result["finish_reason"] == "length"
 
 
+def test_call_vertex_defaults_location_and_accepts_alias(monkeypatch, fake_genai):
+    _clear_steering(monkeypatch)
+    monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+    monkeypatch.delenv("GOOGLE_CLOUD_LOCATION", raising=False)
+    monkeypatch.delenv("VERTEX_LOCATION", raising=False)
+    monkeypatch.setenv("VERTEX_PROJECT", "alias-proj")  # alias accepted
+    llm._call_vertex("gemini-2.5-flash", "dummy")
+    _, kwargs = fake_genai.client_cls.call_args
+    assert kwargs["project"] == "alias-proj"
+    assert kwargs["location"] == "us-central1"  # default region
+
+
 def test_call_vertex_requires_project(monkeypatch, fake_genai):
     _clear_steering(monkeypatch)
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)

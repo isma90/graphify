@@ -202,6 +202,37 @@ def test_push_to_local_bare_remote_succeeds(home, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_out_and_group_are_mutually_exclusive(home, tmp_path):
+    src = _corpus(tmp_path / "svc", "login")
+    r = _run("extract", str(src), "--group", "g", "--out", str(tmp_path / "o"), home=home)
+    assert r.returncode == 2
+    assert "mutually exclusive" in r.stderr
+
+
+def test_explicit_graph_overrides_group(home, tmp_path):
+    # Build a standalone graph and a separate group; --graph must win over --group.
+    standalone = _corpus(tmp_path / "solo", "solo")
+    _run("extract", str(standalone), home=home, cwd=standalone)
+    standalone_graph = standalone / "graphify-out" / "graph.json"
+    src = _corpus(tmp_path / "svc", "login")
+    _run("project", "create", "demo", "--from", str(src), home=home)
+    # --graph points at the standalone graph → should find 'solo', not the group's 'login'
+    r = _run("query", "solo", "--group", "demo", "--graph", str(standalone_graph), home=home)
+    assert r.returncode == 0, r.stderr
+    assert "solo" in r.stdout.lower()
+
+
+def test_project_rename_moves_dir_and_updates_registry(home, tmp_path):
+    src = _corpus(tmp_path / "svc", "login")
+    _run("project", "create", "old", "--from", str(src), home=home)
+    r = _run("project", "rename", "old", "new", home=home)
+    assert r.returncode == 0, r.stderr
+    assert (home / "new" / "graphify-out" / "graph.json").exists()
+    assert not (home / "old").exists()
+    lst = _run("project", "list", home=home)
+    assert "new" in lst.stdout and "old" not in lst.stdout.split("\n")[0]
+
+
 def test_group_dir_is_valid_sleep_brain_root(tmp_path):
     # HOME must contain the brain-root; put GRAPHIFY_HOME under HOME.
     home = tmp_path

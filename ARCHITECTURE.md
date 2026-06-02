@@ -29,6 +29,12 @@ Each stage is a single function in its own module. They communicate through plai
 | `serve.py` | `start_server(graph_path)` | graph file path → MCP stdio server |
 | `watch.py` | `watch(root, flag_path)` | directory → writes flag file on change |
 | `benchmark.py` | `run_benchmark(graph_path)` | graph file → corpus vs subgraph token comparison |
+| `llm.py` | `extract_corpus_parallel(files, backend=...)` | files → semantic `{nodes, edges, hyperedges}` via a pluggable LLM backend |
+| `config.py` | `find_remote / upsert_remote(root)` | repo root → `~/.graphify/config.toml` remote entry (split-mode sync) |
+| `privacy.py` | `classify_paths(paths, root)` | paths → `{path: "private"\|"shared"}` bucket map (split mode) |
+| `git_integration.py` | `commit_shared_via_plumbing / push_branch` | shared graph → git branch (working-tree-safe plumbing) |
+| `migrate.py` | `migrate_to_shared / manifest_v1_to_v2` | legacy layout → split layout / schema upgrade (idempotent) |
+| `projects.py` | `find_group / add_source / import_repo_into_group` | group name → `~/.graphify/<group>/` central knowledge base (see below) |
 
 ## Extraction output schema
 
@@ -85,6 +91,38 @@ Repos without overlays AND without a configured remote stay in legacy mode and c
 - `graphify/config.py` — TOML reader/writer for `~/.graphify/config.toml` (override via `GRAPHIFY_CONFIG`).
 - `graphify/git_integration.py` — git plumbing wrappers (`install_merge_driver`, `commit_shared_via_plumbing` which never touches the working tree, `fetch_shared`, `push_branch`).
 - `graphify/__main__.py:2344-2396` — `merge-driver` subcommand registered as `merge=graphify-shared` in `.gitattributes`.
+
+## Central knowledge groups
+
+A **group** is a named knowledge base stored centrally at `~/.graphify/<name>/` (its own git repo), accumulating multiple source repos/dirs into a single growing graph. It is opt-in and orthogonal to split mode; repos not assigned to a group keep the byte-identical local `graphify-out/` behavior. User-facing docs: `docs/central-groups.md`.
+
+**Layout (A).** The group dir is the git-repo root and `graphify-out/` lives *nested inside it* (`~/.graphify/<name>/graphify-out/graph.json`). This preserves the `<root>/graphify-out/graph.json` contract every consumer already relies on, so the sleep cycle (`--brain-root ~/.graphify/<name>`), `security.validate_graph_path`, and `callflow_html` work unchanged.
+
+**Registry.** `~/.graphify/projects.toml` (override `$GRAPHIFY_PROJECTS`; group dirs under `$GRAPHIFY_HOME`, default `~/.graphify`). `[[group]]` entries hold `name`, `dir`, `created_at`, optional `parent` (composition) and `remote_url`, plus `[[group.source]]` rows. Managed by `graphify/projects.py` (mirrors `config.py`'s atomic-write API).
+
+**Accumulation.** `graphify extract <path> --group <name>` (and the `graphify project add` wrapper) full-scan each new source and `build_merge` into the existing group graph **without cross-source pruning** (so adding repo B never prunes repo A). Node IDs are NOT namespaced — knowledge unifies (unlike `global` / `merge-graphs`, which prefix per repo). Cache lands under the group via an absolute `GRAPHIFY_OUT` set in group mode; `cache._out_base()` honors it. Split-mode overlays are ignored inside a group (single graph in v1).
+
+**Git + sharing.** Each group dir is `git init`'d with a `.gitignore` (cache/backups/transient excluded); `project add`/`push` commit `graphify-out/`. `projects.commit_group` / `push_group` return structured `GitOpResult` and never swallow git errors; `push` requires a remote (`require_remote_url`) and falls back to a local commit when unset.
+
+### Source code references
+
+- `graphify/projects.py` — `Group`/`GroupSource` dataclasses, `sanitize_group_name` (traversal-proof), `load/find/upsert/add_source/rename/remove`, `set_remote/get_remote_url/require_remote_url`, `git_init_group/commit_group/push_group`, `import_repo_into_group` (idempotent, modeled on `migrate.py`).
+- `graphify/__main__.py` — `_cmd_project` (create/add/list/rename/remote/push/import), `resolve_out_root` + `_default_graph_path(group)`, and `--group` on `extract`/`query`/`path`/`explain`.
+- `graphify/cache.py:_out_base(root)` — resolves cache paths, honoring an absolute `GRAPHIFY_OUT` (group dir) at call time.
+
+## LLM backends
+
+Headless semantic extraction (`graphify extract`, `llm.extract_corpus_parallel`) routes through a pluggable backend registry: `BACKENDS` in `graphify/llm.py`. `detect_backend()` auto-selects by environment (static API keys first, then cloud-credential backends, then ollama last — never shadowing a paid key).
+
+| Backend | Auth | Call path |
+|---------|------|-----------|
+| `gemini` / `openai` / `kimi` / `deepseek` / `ollama` | static API key (env) | `_call_openai_compat` (OpenAI SDK) |
+| `claude` | `ANTHROPIC_API_KEY` | `_call_claude` (Anthropic SDK) |
+| `claude-cli` | local `claude` CLI session | `_call_claude_cli` (subprocess) |
+| `bedrock` | AWS credential chain (boto3) | `_call_bedrock` |
+| `vertex` | Google ADC (gcloud / service account) | `_call_vertex` (`google-genai`, `vertexai=True`) |
+
+Cloud-credential backends (`bedrock`, `vertex`) carry no static key: they are exempted from the api-key check in `extract_files_direct` and detected via `AWS_*` / `GOOGLE_GENAI_USE_VERTEXAI` respectively. Every backend normalizes to the common `{nodes, edges, hyperedges, input_tokens, output_tokens, model, finish_reason}` contract so the adaptive-retry/chunking pipeline is backend-agnostic. Optional SDKs are late-imported and gated behind extras (`graphifyy[bedrock]`, `graphifyy[vertex]`, …).
 
 ## Confidence labels
 
