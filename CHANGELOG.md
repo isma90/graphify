@@ -2,6 +2,20 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## Unreleased — Central knowledge groups (`graphify project`)
+
+Graphs can now live centrally at `~/.graphify/<group>/` under a user-chosen semantic name (a client / project / platform) instead of being tied to the scanned repo's `graphify-out/`. A group **accumulates** knowledge from multiple sources into a single growing graph, and each group dir is its own git repo (so the sleep cycle, backups, and versioning work there). Fully opt-in: repos not assigned to a group keep the byte-identical local `graphify-out/` behavior.
+
+- Feat: new `graphify/projects.py` — TOML registry at `~/.graphify/projects.toml` (override `$GRAPHIFY_PROJECTS`; group dirs under `$GRAPHIFY_HOME`, default `~/.graphify`). `Group`/`GroupSource` dataclasses; `load/find/upsert/add_source/rename/remove`; `sanitize_group_name` (filesystem-safe, traversal-proof); `set_remote`/`get_remote_url`/`require_remote_url`; `git_init_group`/`commit_group`/`push_group` (errors returned, never swallowed); `import_repo_into_group` (idempotent, modeled on `migrate.py`).
+- Feat: `graphify project create|add|list|rename|remote|push|import`. `create [--from <path>] [--parent <g>] [--remote <url>] [--no-git]` git-inits the group dir and writes a `.gitignore`. `add <path> --group <name>` accumulates a source. `import <repo> --group <name> [--merge-into <existing>] [--rename <n>]` does assisted migration of a legacy `graphify-out/`, leaving a `.graphify_group` marker.
+- Feat: `graphify extract <path> --group <name>` writes to the central group dir (mutually exclusive with `--out`). Group accumulation full-scans each new source and merges into the group graph **without** cross-source pruning (so adding repo B never prunes repo A); node ids are NOT namespaced (unlike `global`/`merge-graphs`). Split-mode overlays are ignored inside a group (single graph in v1, mirroring the sleep cycle).
+- Feat: `--group <name>` on `query`/`path`/`explain` resolves the graph from the central group.
+- Feat: remote handling — the remote URL must be provided (`require_remote_url` raises an actionable error when unset); `project push` falls back to a local commit when no remote is configured, and surfaces git's stderr on commit/push failure while keeping the local commit intact (retry-safe).
+- Fix: `cache.py` now honors an absolute `GRAPHIFY_OUT` at call time across **all** cache-path computations (`cached_files`/`clear_cache`/legacy `load_cached` fallback previously ignored it) — required for group caches, and a latent fix for any absolute-`GRAPHIFY_OUT` setup.
+- Sleep cycle: a group dir (`~/.graphify/<group>/`, under `$HOME` and a git repo) is a valid `graphify sleep install --brain-root` target with **no template/code changes** (layout keeps `graphify-out/` nested under the group dir).
+- Tests: +47 (`tests/test_projects.py` ×36 unit, `tests/test_projects_cli.py` ×11 end-to-end incl. accumulation, query, import idempotency, push fallback/remote, sleep-against-group). Docs: new `docs/central-groups.md` + README subsection.
+- Deferred: split mode inside groups; multi-collaborator three-way `pull`/merge of a central graph (push is supported); per-source deletion pruning; bulk rewrite of the 11 platform skill files.
+
 ## 0.10.1 (2026-05-27)
 
 Stage 3.1: Hermes plugin (auto-detect + auto-cron + hippocampal drain). 0.10.1 closes the auto-integration gap that 0.10.0 left open: instead of pasting a snippet in Hermes chat, the user runs `graphify sleep install` and the plugin auto-registers all 6 cron jobs on the next Hermes session start. The plugin also implements the hippocampus → neocortex consolidation flow: aged Cortex entries (>7 days) in MEMORY.md are archived to graphify before being removed, turning the previously-destructive Wake cleanup into a knowledge-preserving transfer.

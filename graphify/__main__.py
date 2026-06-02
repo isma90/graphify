@@ -19,7 +19,16 @@ except Exception:
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
 
 
-def _default_graph_path() -> str:
+def _default_graph_path(group: str | None = None) -> str:
+    """Default graph.json path.
+
+    With *group*, resolves to the central group dir
+    (``~/.graphify/<group>/graphify-out/graph.json``); otherwise the legacy
+    repo-local ``graphify-out/graph.json`` (honoring ``GRAPHIFY_OUT``).
+    """
+    if group:
+        from graphify import projects
+        return str(projects.group_root(group) / "graphify-out" / "graph.json")
     return str(Path(_GRAPHIFY_OUT) / "graph.json")
 
 
@@ -1348,6 +1357,329 @@ def _clone_repo(url: str, branch: str | None = None, out_dir: Path | None = None
     return dest
 
 
+# ---------------------------------------------------------------------------
+# Central knowledge groups (`graphify project ...`)
+# ---------------------------------------------------------------------------
+
+# graphify-out artifacts worth versioning in a group repo are committed; the
+# rest (cache, backups, transient flags) are ignored on every machine.
+_GROUP_GITIGNORE = """\
+# Auto-managed by graphify (central knowledge group)
+graphify-out/cache/
+graphify-out/backups/
+graphify-out/*.tmp
+graphify-out/.rebuild.lock
+graphify-out/needs_update
+graphify-out/????-??-??/
+"""
+
+
+def _dispatch(argv: list[str]) -> int:
+    """Run a graphify subcommand in-process and return its exit code.
+
+    Reuses the full CLI (so ``project add`` shares the exact ``extract``
+    pipeline, including --group handling). Restores ``sys.argv`` and the
+    ``GRAPHIFY_OUT`` env var (which group-mode extract mutates) afterwards so
+    one project operation does not leak output-dir state into the next.
+    """
+    saved_argv = sys.argv
+    saved_out = os.environ.get("GRAPHIFY_OUT")
+    sys.argv = ["graphify", *argv]
+    try:
+        main()
+        return 0
+    except SystemExit as exc:
+        if exc.code is None:
+            return 0
+        return exc.code if isinstance(exc.code, int) else 1
+    finally:
+        sys.argv = saved_argv
+        if saved_out is None:
+            os.environ.pop("GRAPHIFY_OUT", None)
+        else:
+            os.environ["GRAPHIFY_OUT"] = saved_out
+
+
+def _git_user_email(path: Path) -> str | None:
+    """Best-effort git ``user.email`` for *path* (or ``None``)."""
+    from graphify.git_integration import _git
+    try:
+        r = _git(path, "config", "user.email", check=False)
+    except Exception:
+        return None
+    val = (r.stdout or "").strip()
+    return val or None
+
+
+def _ensure_group_gitignore(group_dir: Path) -> None:
+    """Write the group repo's .gitignore if absent."""
+    gi = group_dir / ".gitignore"
+    if not gi.exists():
+        gi.write_text(_GROUP_GITIGNORE, encoding="utf-8")
+
+
+def _prompt_group_name() -> str:
+    """Ask for a group name interactively; error out when stdin is not a TTY."""
+    if not sys.stdin.isatty():
+        print(
+            "error: a group name is required (e.g. 'graphify project create <name>')",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    try:
+        return input("Group name (client / project / platform): ").strip()
+    except EOFError:
+        return ""
+
+
+def _group_commit_artifacts(group_dir: Path, message: str) -> None:
+    """Commit the group's graphify-out artifacts, surfacing any git error."""
+    from graphify import projects as P
+    _ensure_group_gitignore(group_dir)
+    res = P.commit_group(group_dir, message, ["graphify-out", ".gitignore"])
+    if res.ok:
+        if res.detail != "nothing to commit":
+            print(f"[graphify project] committed {res.detail} in {group_dir}")
+    else:
+        print(f"[graphify project] warning: commit failed: {res.detail}", file=sys.stderr)
+
+
+def _cmd_project(argv: list[str]) -> None:
+    """Dispatch `graphify project <create|add|list|rename|remote|push|import>`."""
+    from graphify import projects as P
+
+    sub = argv[0] if argv else ""
+    rest = argv[1:]
+
+    if sub == "create":
+        name: str | None = None
+        from_path: Path | None = None
+        parent: str | None = None
+        remote: str | None = None
+        no_git = False
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--from" and i + 1 < len(rest):
+                from_path = Path(rest[i + 1]); i += 2
+            elif a == "--parent" and i + 1 < len(rest):
+                parent = rest[i + 1]; i += 2
+            elif a == "--remote" and i + 1 < len(rest):
+                remote = rest[i + 1]; i += 2
+            elif a == "--no-git":
+                no_git = True; i += 1
+            elif not a.startswith("-") and name is None:
+                name = a; i += 1
+            else:
+                i += 1
+        if not name:
+            name = _prompt_group_name()
+        try:
+            safe = P.sanitize_group_name(name)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr); sys.exit(2)
+        if safe != name:
+            print(f"[graphify project] using sanitized group name: {safe}")
+        if P.find_group(safe) is not None:
+            print(
+                f"error: group '{safe}' already exists. "
+                f"Use 'graphify project add <path> --group {safe}' to add knowledge.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if parent and P.find_group(parent) is None:
+            print(f"error: parent group '{parent}' does not exist", file=sys.stderr)
+            sys.exit(1)
+
+        group_dir = P.group_root(safe)
+        if not no_git:
+            P.git_init_group(group_dir)
+            _ensure_group_gitignore(group_dir)
+        else:
+            group_dir.mkdir(parents=True, exist_ok=True)
+        P.upsert_group(safe, dir=group_dir, parent=parent)
+        if remote:
+            try:
+                P.set_remote(safe, remote)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr); sys.exit(2)
+        print(f"[graphify project] created group '{safe}' at {group_dir}")
+
+        if from_path is not None:
+            _cmd_project(["add", str(from_path), "--group", safe])
+        return
+
+    if sub == "add":
+        path: Path | None = None
+        gname: str | None = None
+        contributor: str | None = None
+        passthrough: list[str] = []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--group" and i + 1 < len(rest):
+                gname = rest[i + 1]; i += 2
+            elif a == "--contributor" and i + 1 < len(rest):
+                contributor = rest[i + 1]; i += 2
+            elif not a.startswith("-") and path is None:
+                path = Path(rest[i]); i += 1
+            else:
+                passthrough.append(a); i += 1
+        if path is None or not gname:
+            print("Usage: graphify project add <path> --group <name> [--contributor X] [extract flags]",
+                  file=sys.stderr)
+            sys.exit(2)
+        grp = P.find_group(gname)
+        if grp is None:
+            print(f"error: group '{gname}' does not exist; run 'graphify project create {gname}' first",
+                  file=sys.stderr)
+            sys.exit(1)
+        if not path.exists():
+            print(f"error: path not found: {path}", file=sys.stderr); sys.exit(1)
+
+        if contributor is None:
+            contributor = _git_user_email(path)
+        P.add_source(grp.name, path, contributor=contributor)
+
+        code = _dispatch(["extract", str(path), "--group", grp.name, *passthrough])
+        if code != 0:
+            print(f"error: extraction failed (exit {code})", file=sys.stderr)
+            sys.exit(code)
+        _group_commit_artifacts(grp.dir, f"graphify: add source {path.name}")
+        return
+
+    if sub == "list":
+        verbose = "--verbose" in rest or "-v" in rest
+        groups = P.load_groups()
+        if not groups:
+            print("No groups yet. Create one: graphify project create <name> --from <path>")
+            return
+        for g in groups:
+            graph = g.dir / "graphify-out" / "graph.json"
+            ncount = "?"
+            if graph.exists():
+                try:
+                    ncount = str(len(json.loads(graph.read_text(encoding="utf-8")).get("nodes", [])))
+                except Exception:
+                    ncount = "?"
+            line = f"{g.name}  ({len(g.sources)} sources, {ncount} nodes)"
+            if g.parent:
+                line += f"  parent={g.parent}"
+            print(line)
+            if verbose:
+                print(f"    dir:     {g.dir}")
+                print(f"    created: {g.created_at or '?'}")
+                if g.remote_url:
+                    print(f"    remote:  {g.remote_url}")
+                for s in g.sources:
+                    print(f"    source:  {s.path}  ({s.contributor or 'no contributor'})")
+        return
+
+    if sub == "rename":
+        if len(rest) < 2:
+            print("Usage: graphify project rename <old> <new>", file=sys.stderr); sys.exit(2)
+        try:
+            g = P.rename_group(rest[0], rest[1])
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr); sys.exit(1)
+        print(f"[graphify project] renamed to '{g.name}' at {g.dir}")
+        return
+
+    if sub == "remote":
+        if len(rest) < 2:
+            print("Usage: graphify project remote <name> <url>", file=sys.stderr); sys.exit(2)
+        try:
+            g = P.set_remote(rest[0], rest[1])
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr); sys.exit(2)
+        print(f"[graphify project] remote for '{g.name}' set to {g.remote_url}")
+        return
+
+    if sub == "push":
+        if not rest:
+            print("Usage: graphify project push <name>", file=sys.stderr); sys.exit(2)
+        gname = rest[0]
+        grp = P.find_group(gname)
+        if grp is None:
+            print(f"error: group '{gname}' does not exist", file=sys.stderr); sys.exit(1)
+        # Commit any pending artifacts first (work is always preserved locally).
+        _group_commit_artifacts(grp.dir, "graphify: sync before push")
+        try:
+            P.require_remote_url(grp.name)
+        except ValueError as exc:
+            # Fallback: graph is committed locally; just tell the user how to
+            # enable push. Not an error — no work was lost.
+            print(f"[graphify project] {exc}", file=sys.stderr)
+            print("[graphify project] graph committed locally; configure a remote, then push again.")
+            return
+        res = P.push_group(grp.name)
+        if not res.ok:
+            print(f"[graphify project push] git failed: {res.detail}", file=sys.stderr)
+            print("[graphify project] local commit is intact — fix the remote and retry "
+                  f"'graphify project push {grp.name}'.", file=sys.stderr)
+            sys.exit(1)
+        print(f"[graphify project] {res.detail}")
+        return
+
+    if sub == "import":
+        repo: Path | None = None
+        gname = None
+        merge_into: str | None = None
+        rename_to: str | None = None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--group" and i + 1 < len(rest):
+                gname = rest[i + 1]; i += 2
+            elif a == "--merge-into" and i + 1 < len(rest):
+                merge_into = rest[i + 1]; i += 2
+            elif a == "--rename" and i + 1 < len(rest):
+                rename_to = rest[i + 1]; i += 2
+            elif not a.startswith("-") and repo is None:
+                repo = Path(rest[i]); i += 1
+            else:
+                i += 1
+        if repo is None or (not gname and not merge_into):
+            print("Usage: graphify project import <repo> --group <name> "
+                  "[--merge-into <existing>] [--rename <name>]", file=sys.stderr)
+            sys.exit(2)
+        target_name = rename_to or gname or merge_into
+        try:
+            res = P.import_repo_into_group(repo, target_name, merge_into=merge_into)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr); sys.exit(1)
+
+        status = res["status"]
+        if status == "no_graphify_out":
+            print(f"error: no graphify-out/graph.json found under {repo} — nothing to import",
+                  file=sys.stderr)
+            sys.exit(1)
+        if status == "already_imported":
+            print(f"[graphify project] {repo} already imported into group '{res['group']}'")
+            return
+        if status == "merged":
+            # Files were not moved; accumulate the repo's knowledge into the group.
+            code = _dispatch(["extract", str(repo.resolve()), "--group", res["group"]])
+            if code != 0:
+                print(f"error: extraction failed (exit {code})", file=sys.stderr); sys.exit(code)
+            grp = P.find_group(res["group"])
+            _group_commit_artifacts(grp.dir, f"graphify: merge {repo.name} into {res['group']}")
+            print(f"[graphify project] merged {repo} into group '{res['group']}'")
+            return
+        # status == "imported": files moved; make the group a committed git repo.
+        grp = P.find_group(res["group"])
+        P.git_init_group(grp.dir)
+        _group_commit_artifacts(grp.dir, f"graphify: import {repo.name}")
+        print(f"[graphify project] imported {repo} → group '{res['group']}' at {res['dir']}")
+        return
+
+    print(
+        "Usage: graphify project <create|add|list|rename|remote|push|import> ...",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
 def main() -> None:
     # Check all known skill install locations for a stale version stamp.
     # Skip during install/uninstall (hook writes trigger a fresh check anyway).
@@ -1406,6 +1738,7 @@ def main() -> None:
         print("    --context C             explicit edge-context filter (repeatable)")
         print("    --budget N              cap output at N tokens (default 2000)")
         print("    --graph <path>          path to graph.json (default graphify-out/graph.json)")
+        print("    --group <name>          query a central knowledge group's graph (query/path/explain)")
         print("  affected \"X\"             reverse traversal to find nodes impacted by X")
         print("    --relation R            edge relation to traverse in reverse (repeatable)")
         print("    --depth N               reverse traversal depth (default 2)")
@@ -1432,10 +1765,28 @@ def main() -> None:
         print("    --max-concurrency N     parallel semantic chunks in flight (default: 4; set 1 for local LLMs)")
         print("    --api-timeout S         per-request timeout in seconds for the LLM client (default: 600)")
         print("    --out DIR               output dir (default: <path>); writes <DIR>/graphify-out/")
+        print("    --group NAME            write to a central knowledge group at ~/.graphify/<NAME>/")
+        print("                            (accumulates; mutually exclusive with --out)")
         print("    --google-workspace      export .gdoc/.gsheet/.gslides shortcuts via gws before extraction")
         print("    --no-cluster            skip clustering, write raw extraction only")
         print("    --global                also merge the resulting graph into the global graph")
         print("    --as <tag>              repo tag for --global (default: target directory name)")
+        print("  project create <name>   create a central knowledge group at ~/.graphify/<name>/ (its own git repo)")
+        print("    --from <path>            extract <path> into the new group immediately")
+        print("    --parent <group>         nest under an existing group (composition)")
+        print("    --remote <url>           set a dedicated push remote for the group")
+        print("    --no-git                 skip git init for the group dir")
+        print("  project add <path>      accumulate a repo/dir into a group's single growing graph")
+        print("    --group <name>           target group (required)")
+        print("    --contributor <name>     contributor tag for this source (default: git user.email)")
+        print("  project list            list groups (name, sources, node count); --verbose for detail")
+        print("  project rename <o> <n>  rename a group and move its directory")
+        print("  project remote <n> <url>  set/update the group's git remote URL (required for push)")
+        print("  project push <name>     commit + push the group graph (falls back to local commit if no remote)")
+        print("  project import <repo>   move an existing repo graphify-out/ into a group (assisted migration)")
+        print("    --group <name>           target group name")
+        print("    --merge-into <existing>  accumulate into an existing group instead of moving")
+        print("    --rename <name>          rename the imported group")
         print("  global add <graph.json>  add/update a project graph in the global graph (~/.graphify/global-graph.json)")
         print("    --as <tag>               repo tag (default: parent directory name)")
         print("  global remove <tag>      remove a repo's nodes from the global graph")
@@ -1710,11 +2061,18 @@ def main() -> None:
         question = sys.argv[2]
         use_dfs = "--dfs" in sys.argv
         budget = 2000
-        graph_path = _default_graph_path()
+        graph_path = None
+        _group = None
         context_filters: list[str] = []
         args = sys.argv[3:]
         i = 0
         while i < len(args):
+            if args[i] == "--group" and i + 1 < len(args):
+                _group = args[i + 1]; i += 2
+                continue
+            if args[i].startswith("--group="):
+                _group = args[i].split("=", 1)[1]; i += 1
+                continue
             if args[i] == "--budget" and i + 1 < len(args):
                 try:
                     budget = int(args[i + 1])
@@ -1739,6 +2097,8 @@ def main() -> None:
                 graph_path = args[i + 1]; i += 2
             else:
                 i += 1
+        # --graph wins; else --group's central graph; else the legacy default.
+        graph_path = graph_path or _default_graph_path(_group)
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -1858,11 +2218,15 @@ def main() -> None:
         import networkx as _nx
         source_label = sys.argv[2]
         target_label = sys.argv[3]
-        graph_path = _default_graph_path()
+        graph_path = None
+        _group = None
         args = sys.argv[4:]
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
+            elif a == "--group" and i + 1 < len(args):
+                _group = args[i + 1]
+        graph_path = graph_path or _default_graph_path(_group)
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -1940,11 +2304,15 @@ def main() -> None:
         from graphify.serve import _find_node
         from networkx.readwrite import json_graph
         label = sys.argv[2]
-        graph_path = _default_graph_path()
+        graph_path = None
+        _group = None
         args = sys.argv[3:]
         for i, a in enumerate(args):
             if a == "--graph" and i + 1 < len(args):
                 graph_path = args[i + 1]
+            elif a == "--group" and i + 1 < len(args):
+                _group = args[i + 1]
+        graph_path = graph_path or _default_graph_path(_group)
         gp = Path(graph_path).resolve()
         if not gp.exists():
             print(f"error: graph file not found: {gp}", file=sys.stderr)
@@ -2735,6 +3103,9 @@ def main() -> None:
         result = run_benchmark(graph_path, corpus_words=corpus_words)
         print_benchmark(result)
 
+    elif cmd == "project":
+        _cmd_project(sys.argv[2:])
+
     elif cmd == "global":
         subcmd = sys.argv[2] if len(sys.argv) > 2 else ""
         from graphify.global_graph import (
@@ -2816,6 +3187,7 @@ def main() -> None:
         backend: str | None = None
         model: str | None = None
         out_dir: Path | None = None
+        group: str | None = None
         no_cluster = False
         dedup_llm = False
         google_workspace = False
@@ -2869,6 +3241,10 @@ def main() -> None:
                 out_dir = Path(args[i + 1]); i += 2
             elif a.startswith("--out="):
                 out_dir = Path(a.split("=", 1)[1]); i += 1
+            elif a == "--group" and i + 1 < len(args):
+                group = args[i + 1]; i += 2
+            elif a.startswith("--group="):
+                group = a.split("=", 1)[1]; i += 1
             elif a == "--no-cluster":
                 no_cluster = True; i += 1
             elif a == "--dedup-llm":
@@ -2994,9 +3370,35 @@ def main() -> None:
         # Resolve output dir. The user-facing contract is "<out>/graphify-out/"
         # so a fresh checkout writes graphify-out/ at the project root, matching
         # the skill.md pipeline.
-        out_root = (out_dir.resolve() if out_dir else target)
+        #
+        # --group routes output to a central knowledge group at
+        # ~/.graphify/<group>/graphify-out/ (the group dir is its own git repo).
+        # Layout (A): keeping graphify-out/ nested under the group dir preserves
+        # the <root>/graphify-out/graph.json contract that the sleep cycle,
+        # hooks, and security checks already rely on.
+        if group is not None and out_dir is not None:
+            print("error: --out and --group are mutually exclusive", file=sys.stderr)
+            sys.exit(2)
+
+        group_mode = group is not None
+        if group_mode:
+            from graphify import projects as _projects
+            try:
+                _safe_group = _projects.sanitize_group_name(group)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                sys.exit(2)
+            out_root = _projects.group_root(_safe_group)
+            _projects.git_init_group(out_root)  # idempotent: ensures a git repo
+        else:
+            out_root = (out_dir.resolve() if out_dir else target)
         graphify_out = out_root / "graphify-out"
         graphify_out.mkdir(parents=True, exist_ok=True)
+
+        # Point the per-file cache at the group dir (absolute GRAPHIFY_OUT wins
+        # in cache._out_base) while file_hash keys stay relative to `target`.
+        if group_mode:
+            os.environ["GRAPHIFY_OUT"] = str(graphify_out)
 
         from graphify.detect import (
             detect as _detect,
@@ -3006,6 +3408,15 @@ def main() -> None:
         manifest_path = graphify_out / "manifest.json"
         existing_graph_path = graphify_out / "graph.json"
         incremental_mode = manifest_path.exists() and existing_graph_path.exists()
+
+        # Group accumulation: adding a NEW source to an existing group must
+        # full-scan that source (detect_incremental would flag the previous
+        # sources' files as "deleted" — they live under a different target —
+        # and prune them) and merge into the group graph WITHOUT cross-source
+        # pruning. The content-hash cache still makes unchanged files cheap.
+        group_accumulate = group_mode and existing_graph_path.exists()
+        if group_mode:
+            incremental_mode = False
 
         if incremental_mode:
             print(f"[graphify extract] incremental scan of {target}")
@@ -3022,6 +3433,16 @@ def main() -> None:
         # privacy_map is None in legacy mode (no overlay files present).
         # Non-None means new mode: split into graph-private.json + graph-shared.json.
         privacy_map = detection.get("privacy_map")
+
+        # Groups are single-graph in v1 (split mode deferred, mirroring the
+        # sleep cycle's refusal). Ignore any overlays the source repo carries.
+        if group_mode and privacy_map is not None:
+            print(
+                f"[graphify extract] note: split-mode overlays ignored for group "
+                f"'{_safe_group}' — groups are single-graph (see docs/central-groups).",
+                file=sys.stderr,
+            )
+            privacy_map = None
 
         files_by_type = detection.get("files", {})
         if incremental_mode:
@@ -3251,11 +3672,13 @@ def main() -> None:
             # LEGACY MODE: behaviour identical to v0.8.18.
             # Single graph.json output, manifest without origin fields.
             # ----------------------------------------------------------------
-            if incremental_mode:
+            if incremental_mode or group_accumulate:
                 G = _build_merge(
                     [merged],
                     graph_path=existing_graph_path,
-                    prune_sources=deleted_files or None,
+                    # Never prune across sources when accumulating a group —
+                    # only an incremental re-scan of the same source prunes.
+                    prune_sources=(deleted_files or None) if incremental_mode else None,
                     dedup=True,
                     dedup_llm_backend=dedup_backend,
                     root=target,

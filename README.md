@@ -342,6 +342,22 @@ The mental model: any file matched by `.graphifyshared` goes into the shared buc
 
 ---
 
+### Central knowledge groups (multi-repo projects)
+
+To concentrate the knowledge of a **client / platform / project that spans several repos** into one place, use a **knowledge group** stored centrally at `~/.graphify/<name>/` (its own git repo) instead of a per-repo `graphify-out/`. You pick the semantic name; the group **accumulates** sources into a single growing graph.
+
+```bash
+graphify project create agrosuper --from ~/repos/agrosuper/db-corpus
+graphify project add ~/repos/agrosuper/api --group agrosuper   # accumulates
+graphify query "how does the api talk to the db" --group agrosuper
+graphify project remote agrosuper git@github.com:me/agrosuper-graph.git
+graphify project push agrosuper                                # falls back to local commit if no remote
+```
+
+Repos not assigned to a group keep the default local `graphify-out/` behavior. See [docs/central-groups.md](docs/central-groups.md) for the full reference, migration (`graphify project import`), and limitations.
+
+---
+
 ## Using the graph directly
 
 ```bash

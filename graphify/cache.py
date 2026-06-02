@@ -8,10 +8,24 @@ import os
 import tempfile
 from pathlib import Path
 
-# Output directory name — override with GRAPHIFY_OUT env var for worktrees or
-# shared-output setups. Accepts a relative name ("graphify-out-feature") or an
-# absolute path ("/shared/graphify-out").
+# Output directory name — override with GRAPHIFY_OUT env var for worktrees,
+# shared-output setups, or central knowledge groups. Accepts a relative name
+# ("graphify-out-feature") or an absolute path ("/shared/graphify-out").
+#
+# Read lazily via _out_base() (NOT cached at import) so that callers which set
+# GRAPHIFY_OUT to an absolute group dir at runtime are honored, and so an
+# absolute override consistently wins across every cache-path computation.
 _GRAPHIFY_OUT = os.environ.get("GRAPHIFY_OUT", "graphify-out")
+
+
+def _out_base(root: Path) -> Path:
+    """Resolve the output base dir for *root*, honoring an absolute GRAPHIFY_OUT.
+
+    An absolute ``GRAPHIFY_OUT`` (e.g. a central group's ``graphify-out`` dir)
+    wins outright; a relative value nests under ``root``.
+    """
+    out = Path(os.environ.get("GRAPHIFY_OUT", "graphify-out"))
+    return out if out.is_absolute() else Path(root).resolve() / out
 
 
 def _body_content(content: bytes) -> bytes:
@@ -36,9 +50,7 @@ _stat_index_dirty: bool = False
 
 
 def _stat_index_file(root: Path) -> Path:
-    _out = Path(_GRAPHIFY_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
-    return base / "cache" / "stat-index.json"
+    return _out_base(root) / "cache" / "stat-index.json"
 
 
 def _ensure_stat_index(root: Path) -> None:
@@ -152,9 +164,7 @@ def cache_dir(root: Path = Path("."), kind: str = "ast") -> Path:
     kind is "ast" or "semantic". Separate subdirectories prevent semantic cache
     entries from overwriting AST cache entries for the same source_file (#582).
     """
-    _out = Path(_GRAPHIFY_OUT)
-    base = _out if _out.is_absolute() else Path(root).resolve() / _out
-    d = base / "cache" / kind
+    d = _out_base(root) / "cache" / kind
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -181,7 +191,7 @@ def load_cached(path: Path, root: Path = Path("."), kind: str = "ast") -> dict |
             return None
     # Migration fallback: check legacy flat cache/ dir for AST entries
     if kind == "ast":
-        legacy = Path(root).resolve() / _GRAPHIFY_OUT / "cache" / f"{h}.json"
+        legacy = _out_base(root) / "cache" / f"{h}.json"
         if legacy.exists():
             try:
                 return json.loads(legacy.read_text(encoding="utf-8"))
@@ -232,7 +242,7 @@ def save_cached(path: Path, result: dict, root: Path = Path("."), kind: str = "a
 
 def cached_files(root: Path = Path(".")) -> set[str]:
     """Return set of file hashes that have a valid cache entry (any kind)."""
-    base = Path(root).resolve() / _GRAPHIFY_OUT / "cache"
+    base = _out_base(root) / "cache"
     hashes: set[str] = set()
     # Legacy flat entries
     if base.is_dir():
@@ -247,7 +257,7 @@ def cached_files(root: Path = Path(".")) -> set[str]:
 
 def clear_cache(root: Path = Path(".")) -> None:
     """Delete all cache entries (ast/, semantic/, and legacy flat entries)."""
-    base = Path(root).resolve() / _GRAPHIFY_OUT / "cache"
+    base = _out_base(root) / "cache"
     # Legacy flat entries
     if base.is_dir():
         for f in base.glob("*.json"):
